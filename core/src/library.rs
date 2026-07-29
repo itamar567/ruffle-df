@@ -8,8 +8,10 @@ use crate::font::{Font, FontDescriptor, FontLike, FontQuery, FontType};
 use crate::prelude::*;
 use crate::string::AvmString;
 use crate::tag_utils::SwfMovie;
+use gc_arena::barrier::unlock;
 use gc_arena::collect::Trace;
-use gc_arena::{Collect, Mutation};
+use gc_arena::lock::RefLock;
+use gc_arena::{Collect, Finalization, Gc, GcWeak, Mutation};
 use ruffle_render::backend::RenderBackend;
 use ruffle_render::bitmap::BitmapHandle;
 use ruffle_render::utils::remove_invalid_jpeg_data;
@@ -115,11 +117,40 @@ impl<'gc> Avm2ClassRegistry<'gc> {
     }
 }
 
+#[derive(Collect)]
+#[collect(no_drop)]
+pub(crate) struct MovieLibraryLiveness<'gc> {
+    dependencies: RefLock<Vec<Gc<'gc, MovieLibraryLiveness<'gc>>>>,
+}
+
+impl<'gc> MovieLibraryLiveness<'gc> {
+    fn new(mc: &Mutation<'gc>) -> Gc<'gc, Self> {
+        Gc::new(
+            mc,
+            Self {
+                dependencies: RefLock::new(Vec::new()),
+            },
+        )
+    }
+
+    fn add_dependency(this: Gc<'gc, Self>, dependency: Gc<'gc, Self>, mc: &Mutation<'gc>) {
+        let mut dependencies = unlock!(Gc::write(mc, this), Self, dependencies).borrow_mut();
+        if !dependencies
+            .iter()
+            .any(|existing| Gc::ptr_eq(*existing, dependency))
+        {
+            dependencies.push(dependency);
+        }
+    }
+}
+
 /// Symbol library for a single given SWF.
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct MovieLibrary<'gc> {
-    swf: Arc<SwfMovie>,
+    #[collect(require_static)]
+    swf: Weak<SwfMovie>,
+    liveness: Option<GcWeak<'gc, MovieLibraryLiveness<'gc>>>,
     characters: HashMap<CharacterId, Character<'gc>>,
     export_characters: Avm1PropertyMap<'gc, CharacterId>,
     imported_assets: HashMap<AvmString<'gc>, CharacterId>,
@@ -129,9 +160,10 @@ pub struct MovieLibrary<'gc> {
 }
 
 impl<'gc> MovieLibrary<'gc> {
-    pub fn new(swf: Arc<SwfMovie>) -> Self {
+    pub fn new(swf: &Arc<SwfMovie>) -> Self {
         Self {
-            swf,
+            swf: Arc::downgrade(swf),
+            liveness: None,
             characters: HashMap::new(),
             imported_assets: HashMap::new(),
             export_characters: Avm1PropertyMap::new(),
@@ -252,11 +284,11 @@ impl<'gc> MovieLibrary<'gc> {
         character: Character<'gc>,
         mc: &Mutation<'gc>,
     ) -> Option<DisplayObject<'gc>> {
-        match character {
+        let display_object = match character {
             Character::Bitmap(bitmap) => {
                 let avm2_class = bitmap.avm2_class();
                 let bitmap = bitmap.compressed().decode().unwrap();
-                let bitmap = Bitmap::new(mc, id, bitmap, self.swf.clone());
+                let bitmap = Bitmap::new(mc, id, bitmap, self.swf.upgrade()?);
                 bitmap.set_avm2_bitmapdata_class(mc, avm2_class);
                 Some(bitmap.instantiate(mc))
             }
@@ -272,7 +304,23 @@ impl<'gc> MovieLibrary<'gc> {
                 // Cannot instantiate non-display object
                 None
             }
+        };
+
+        if let Some(display_object) = display_object
+            && let Some(liveness) = self.liveness(mc)
+        {
+            display_object.set_movie_library_liveness(mc, Some(liveness));
         }
+
+        display_object
+    }
+
+    fn set_liveness(&mut self, liveness: Gc<'gc, MovieLibraryLiveness<'gc>>) {
+        self.liveness = Some(Gc::downgrade(liveness));
+    }
+
+    fn liveness(&self, mc: &Mutation<'gc>) -> Option<Gc<'gc, MovieLibraryLiveness<'gc>>> {
+        self.liveness.and_then(|liveness| liveness.upgrade(mc))
     }
 
     pub fn get_font(&self, id: CharacterId) -> Option<Font<'gc>> {
@@ -415,7 +463,15 @@ impl<'gc> MovieLibraries<'gc> {
     fn get_or_insert_mut(&mut self, movie: Arc<SwfMovie>) -> &mut MovieLibrary<'gc> {
         self.0
             .entry(movie.clone())
-            .or_insert_with(|| MovieLibrary::new(movie))
+            .or_insert_with(|| MovieLibrary::new(&movie))
+    }
+
+    fn remove_dead(&mut self, fc: &Finalization<'gc>) {
+        self.0.retain(|_, library| {
+            library
+                .liveness
+                .is_none_or(|liveness| !liveness.is_dead(fc))
+        });
     }
 
     fn known_movies(&self) -> impl Iterator<Item = Arc<SwfMovie>> {
@@ -480,6 +536,41 @@ impl<'gc> Library<'gc> {
 
     pub fn known_movies(&self) -> impl Iterator<Item = Arc<SwfMovie>> {
         self.movie_libraries.known_movies()
+    }
+
+    pub fn activate_movie(
+        &mut self,
+        movie: Arc<SwfMovie>,
+        owner: DisplayObject<'gc>,
+        mc: &Mutation<'gc>,
+    ) {
+        let library = self.library_for_movie_mut(movie);
+        let liveness = library
+            .liveness(mc)
+            .unwrap_or_else(|| MovieLibraryLiveness::new(mc));
+        library.set_liveness(liveness);
+        owner.set_movie_library_liveness(mc, Some(liveness));
+    }
+
+    pub fn add_movie_dependency(
+        &mut self,
+        movie: Arc<SwfMovie>,
+        dependency: Arc<SwfMovie>,
+        mc: &Mutation<'gc>,
+    ) {
+        let dependency = self
+            .library_for_movie(dependency)
+            .and_then(|library| library.liveness(mc));
+        let liveness = self
+            .library_for_movie(movie)
+            .and_then(|library| library.liveness(mc));
+        if let (Some(liveness), Some(dependency)) = (liveness, dependency) {
+            MovieLibraryLiveness::add_dependency(liveness, dependency, mc);
+        }
+    }
+
+    pub(crate) fn remove_dead_movie_libraries(&mut self, fc: &Finalization<'gc>) {
+        self.movie_libraries.remove_dead(fc);
     }
 
     /// Returns the default Font implementations behind the built in names (ie `_sans`)
@@ -832,5 +923,212 @@ impl<'gc> FontMap<'gc> {
 
     pub fn all(&self) -> Vec<Font<'gc>> {
         self.0.values().copied().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::display_object::MovieClip;
+    use gc_arena::lock::GcRefLock;
+    use gc_arena::{Arena, Rootable};
+
+    #[derive(Collect)]
+    #[collect(no_drop)]
+    struct TestRoot<'gc>(GcRefLock<'gc, TestRootData<'gc>>);
+
+    #[derive(Collect)]
+    #[collect(no_drop)]
+    struct TestRootData<'gc> {
+        library: Library<'gc>,
+        liveness: Option<Gc<'gc, MovieLibraryLiveness<'gc>>>,
+        object: Option<DisplayObject<'gc>>,
+    }
+
+    type TestArena = Arena<Rootable![TestRoot<'_>]>;
+
+    fn finish_collection(arena: &mut TestArena) {
+        arena.finish_marking().unwrap().finalize(|fc, root| {
+            root.0
+                .borrow_mut(fc)
+                .library
+                .remove_dead_movie_libraries(fc)
+        });
+        arena.finish_cycle();
+    }
+
+    fn library_count(arena: &TestArena) -> usize {
+        arena.mutate(|_, root| root.0.borrow().library.known_movies().count())
+    }
+
+    fn arena_with_movie(
+        keep_liveness: bool,
+        instantiate_character: bool,
+    ) -> (TestArena, Weak<SwfMovie>) {
+        let movie = Arc::new(SwfMovie::empty(10, None));
+        let weak_movie = Arc::downgrade(&movie);
+        let arena = Arena::new(move |mc| {
+            let mut library = Library::empty();
+            let liveness = MovieLibraryLiveness::new(mc);
+            let movie_library = library.library_for_movie_mut(movie.clone());
+            movie_library.set_liveness(liveness);
+            movie_library
+                .register_character(1, Character::MovieClip(MovieClip::new(movie.clone(), mc)));
+            let object =
+                instantiate_character.then(|| movie_library.instantiate_by_id(1, mc).unwrap());
+
+            TestRoot(GcRefLock::new(
+                mc,
+                TestRootData {
+                    library,
+                    liveness: keep_liveness.then_some(liveness),
+                    object,
+                }
+                .into(),
+            ))
+        });
+        (arena, weak_movie)
+    }
+
+    #[test]
+    fn live_movie_liveness_retains_library() {
+        let (mut arena, weak_movie) = arena_with_movie(true, false);
+
+        finish_collection(&mut arena);
+
+        assert_eq!(library_count(&arena), 1);
+        assert!(weak_movie.upgrade().is_some());
+    }
+
+    #[test]
+    fn instantiated_character_retains_library() {
+        let (mut arena, weak_movie) = arena_with_movie(false, true);
+
+        finish_collection(&mut arena);
+        assert_eq!(library_count(&arena), 1);
+
+        arena.mutate(|mc, root| root.0.borrow_mut(mc).object = None);
+        finish_collection(&mut arena);
+        assert_eq!(library_count(&arena), 0);
+        assert!(weak_movie.upgrade().is_some());
+
+        finish_collection(&mut arena);
+        assert!(weak_movie.upgrade().is_none());
+    }
+
+    #[test]
+    fn activating_new_movie_replaces_owner_liveness() {
+        let movie_a = Arc::new(SwfMovie::empty(10, None));
+        let movie_b = Arc::new(SwfMovie::empty(10, None));
+        let weak_movie_a = Arc::downgrade(&movie_a);
+        let weak_movie_b = Arc::downgrade(&movie_b);
+        let mut arena = Arena::new(move |mc| {
+            let mut library = Library::empty();
+            let owner: DisplayObject = MovieClip::new(movie_a.clone(), mc).into();
+
+            library.activate_movie(movie_a.clone(), owner, mc);
+            library.activate_movie(movie_b.clone(), owner, mc);
+            library
+                .library_for_movie_mut(movie_a.clone())
+                .register_character(1, Character::MovieClip(MovieClip::new(movie_a, mc)));
+            library
+                .library_for_movie_mut(movie_b.clone())
+                .register_character(1, Character::MovieClip(MovieClip::new(movie_b, mc)));
+
+            TestRoot(GcRefLock::new(
+                mc,
+                TestRootData {
+                    library,
+                    liveness: None,
+                    object: Some(owner),
+                }
+                .into(),
+            ))
+        });
+
+        finish_collection(&mut arena);
+
+        arena.mutate(|_, root| {
+            let data = root.0.borrow();
+            assert!(
+                data.library
+                    .library_for_movie(weak_movie_a.upgrade().unwrap())
+                    .is_none()
+            );
+            assert!(
+                data.library
+                    .library_for_movie(weak_movie_b.upgrade().unwrap())
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn cyclic_movie_dependencies_are_collected() {
+        let movie_a = Arc::new(SwfMovie::empty(10, None));
+        let movie_b = Arc::new(SwfMovie::empty(10, None));
+        let weak_movie_a = Arc::downgrade(&movie_a);
+        let weak_movie_b = Arc::downgrade(&movie_b);
+        let mut arena = Arena::new(move |mc| {
+            let mut library = Library::empty();
+            let liveness_a = MovieLibraryLiveness::new(mc);
+            let liveness_b = MovieLibraryLiveness::new(mc);
+
+            let library_a = library.library_for_movie_mut(movie_a.clone());
+            library_a.set_liveness(liveness_a);
+            library_a.register_character(1, Character::MovieClip(MovieClip::new(movie_a, mc)));
+
+            let library_b = library.library_for_movie_mut(movie_b.clone());
+            library_b.set_liveness(liveness_b);
+            library_b.register_character(1, Character::MovieClip(MovieClip::new(movie_b, mc)));
+
+            MovieLibraryLiveness::add_dependency(liveness_a, liveness_b, mc);
+            MovieLibraryLiveness::add_dependency(liveness_b, liveness_a, mc);
+
+            TestRoot(GcRefLock::new(
+                mc,
+                TestRootData {
+                    library,
+                    liveness: None,
+                    object: None,
+                }
+                .into(),
+            ))
+        });
+
+        finish_collection(&mut arena);
+        assert_eq!(library_count(&arena), 0);
+
+        finish_collection(&mut arena);
+        assert!(weak_movie_a.upgrade().is_none());
+        assert!(weak_movie_b.upgrade().is_none());
+    }
+
+    #[test]
+    fn expired_movie_keys_are_removed() {
+        let movie = Arc::new(SwfMovie::empty(10, None));
+        let mut arena: TestArena = Arena::new(move |mc| {
+            let mut library = Library::empty();
+            library.library_for_movie_mut(movie);
+            TestRoot(GcRefLock::new(
+                mc,
+                TestRootData {
+                    library,
+                    liveness: None,
+                    object: None,
+                }
+                .into(),
+            ))
+        });
+
+        assert_eq!(
+            arena.mutate(|_, root| root.0.borrow().library.movie_libraries.0.len()),
+            1
+        );
+        finish_collection(&mut arena);
+        assert_eq!(
+            arena.mutate(|_, root| root.0.borrow().library.movie_libraries.0.len()),
+            0
+        );
     }
 }

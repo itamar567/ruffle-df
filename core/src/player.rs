@@ -2385,8 +2385,16 @@ impl Player {
         });
         self.update_mouse_state(EnumSet::empty(), false, &mut false);
 
-        // GC
-        self.gc_arena.borrow_mut().collect_debt();
+        let mut arena = self.gc_arena.borrow_mut();
+        if let Some(marked) = arena.mark_debt() {
+            marked.finalize(|fc, root| {
+                root.data
+                    .borrow_mut(fc)
+                    .library
+                    .remove_dead_movie_libraries(fc);
+            });
+        }
+        arena.cycle_debt();
 
         rval
     }

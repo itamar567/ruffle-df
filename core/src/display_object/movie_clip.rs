@@ -319,7 +319,11 @@ impl<'gc> MovieClip<'gc> {
 
         let data = MovieClipData::new(shared, context.gc());
         data.flags.set(MovieClipFlags::PLAYING);
-        MovieClip(Gc::new(context.gc(), data))
+        let movie_clip = MovieClip(Gc::new(context.gc(), data));
+        context
+            .library
+            .activate_movie(movie_clip.movie(), movie_clip.into(), context.gc_context);
+        movie_clip
     }
 
     /// Construct a movie clip that represents the root movie
@@ -354,6 +358,11 @@ impl<'gc> MovieClip<'gc> {
         data.base.base.set_instantiated_by_timeline(true);
 
         let mc = MovieClip(Gc::new(activation.gc(), data));
+        activation.context.library.activate_movie(
+            movie.clone(),
+            mc.into(),
+            activation.context.gc_context,
+        );
         if let Some(loader_info) = loader_info {
             loader_info.set_loader_stream(LoaderStream::Swf(movie, mc.into()), activation.gc());
         }
@@ -391,12 +400,16 @@ impl<'gc> MovieClip<'gc> {
 
         unlock!(write, MovieClipData, shared).set(Gc::new(
             context.gc(),
-            MovieClipShared::with_data(0, movie.into(), total_frames, loader_info, None),
+            MovieClipShared::with_data(0, movie.clone().into(), total_frames, loader_info, None),
         ));
         write.tag_stream_pos.set(0);
         write.flags.set(MovieClipFlags::PLAYING);
         write.current_frame.set(0);
         write.audio_stream.take();
+
+        context
+            .library
+            .activate_movie(movie, self.into(), context.gc_context);
     }
 
     pub fn set_initialized(self) {
@@ -3953,9 +3966,10 @@ impl<'gc, 'a> MovieClipShared<'gc> {
 
     #[inline]
     fn import_exports_of_importer(&self, context: &mut UpdateContext<'gc>) {
-        let Some(importer_library) = self
-            .importer_movie
-            .and_then(|mc| context.library.library_for_movie(mc.movie()))
+        let Some(importer_movie) = self.importer_movie.map(|movie| movie.movie()) else {
+            return;
+        };
+        let Some(importer_library) = context.library.library_for_movie(importer_movie.clone())
         else {
             return;
         };
@@ -3969,7 +3983,11 @@ impl<'gc, 'a> MovieClipShared<'gc> {
             })
             .collect::<HashMap<AvmString<'gc>, (CharacterId, Character<'gc>)>>();
 
-        let self_library = self.library_mut(context);
+        let movie = self.movie();
+        context
+            .library
+            .add_movie_dependency(movie.clone(), importer_movie, context.gc_context);
+        let self_library = context.library.library_for_movie_mut(movie);
         for (name, (id, character)) in exported_from_importer {
             if self_library.character_by_id(id).is_none() {
                 self_library.register_character(id, character);
@@ -4035,6 +4053,11 @@ impl<'gc, 'a> MovieClipShared<'gc> {
                 tracing::debug!("register_export asset: {} (ID: {})", name, export.id);
 
                 if let Some(parent) = &importer_movie {
+                    context.library.add_movie_dependency(
+                        parent.clone(),
+                        self.movie(),
+                        context.gc_context,
+                    );
                     let parent_library = context.library.library_for_movie_mut(parent.clone());
 
                     if let Some(id) = parent_library.character_id_by_import_name(name) {

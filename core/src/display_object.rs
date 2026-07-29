@@ -8,6 +8,7 @@ use crate::avm2::{
 };
 use crate::context::{RenderContext, UpdateContext};
 use crate::drawing::Drawing;
+use crate::library::MovieLibraryLiveness;
 use crate::prelude::*;
 use crate::string::{AvmString, WString};
 use crate::tag_utils::SwfMovie;
@@ -292,6 +293,8 @@ pub struct DisplayObjectBase<'gc> {
 
     meta_data: Lock<Option<Avm2Object<'gc>>>,
 
+    movie_library_liveness: Lock<Option<Gc<'gc, MovieLibraryLiveness<'gc>>>>,
+
     /// The blend mode used when rendering this display object.
     /// Values other than the default `BlendMode::Normal` implicitly cause cache-as-bitmap behavior.
     blend_mode: Cell<ExtendedBlendMode>,
@@ -355,6 +358,7 @@ impl Default for DisplayObjectBase<'_> {
             masker: Lock::new(None),
             maskee: Lock::new(None),
             meta_data: Lock::new(None),
+            movie_library_liveness: Lock::new(None),
             sound_transform: Default::default(),
             blend_mode: Default::default(),
             opaque_background: Default::default(),
@@ -2896,6 +2900,19 @@ macro_rules! impl_downcast_methods {
 }
 
 impl<'gc> DisplayObject<'gc> {
+    pub(crate) fn set_movie_library_liveness(
+        self,
+        mc: &Mutation<'gc>,
+        liveness: Option<Gc<'gc, MovieLibraryLiveness<'gc>>>,
+    ) {
+        unlock!(
+            Gc::write(mc, self.base()),
+            DisplayObjectBase,
+            movie_library_liveness
+        )
+        .set(liveness);
+    }
+
     pub fn ptr_eq(a: DisplayObject<'gc>, b: DisplayObject<'gc>) -> bool {
         std::ptr::eq(a.as_ptr(), b.as_ptr())
     }
