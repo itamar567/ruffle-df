@@ -21,7 +21,7 @@ use crate::font::DefaultFont;
 use fnv::{FnvHashMap, FnvHashSet};
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
-use weak_table::{PtrWeakKeyHashMap, WeakValueHashMap, traits::WeakElement};
+use weak_table::{WeakValueHashMap, traits::WeakElement};
 
 #[derive(Clone)]
 struct MovieSymbol(Arc<SwfMovie>, CharacterId);
@@ -440,42 +440,43 @@ impl ruffle_render::bitmap::BitmapSource for MovieLibrarySource<'_, '_> {
     }
 }
 
-struct MovieLibraries<'gc>(PtrWeakKeyHashMap<Weak<SwfMovie>, MovieLibrary<'gc>>);
+struct MovieLibraries<'gc>(HashMap<*const SwfMovie, MovieLibrary<'gc>>);
 
 unsafe impl<'gc> Collect<'gc> for MovieLibraries<'gc> {
     #[inline]
     fn trace<C: Trace<'gc>>(&self, cc: &mut C) {
-        for (_, val) in self.0.iter() {
-            cc.trace(val);
+        for library in self.0.values() {
+            cc.trace(library);
         }
     }
 }
 
 impl<'gc> MovieLibraries<'gc> {
     fn new() -> Self {
-        Self(PtrWeakKeyHashMap::new())
+        Self(HashMap::new())
     }
 
-    fn get(&self, key: &Arc<SwfMovie>) -> Option<&MovieLibrary<'gc>> {
-        self.0.get(key)
+    fn get(&self, movie: &Arc<SwfMovie>) -> Option<&MovieLibrary<'gc>> {
+        self.0.get(&Arc::as_ptr(movie))
     }
 
     fn get_or_insert_mut(&mut self, movie: Arc<SwfMovie>) -> &mut MovieLibrary<'gc> {
         self.0
-            .entry(movie.clone())
+            .entry(Arc::as_ptr(&movie))
             .or_insert_with(|| MovieLibrary::new(&movie))
     }
 
     fn remove_dead(&mut self, fc: &Finalization<'gc>) {
         self.0.retain(|_, library| {
-            library
-                .liveness
-                .is_none_or(|liveness| !liveness.is_dead(fc))
+            library.swf.upgrade().is_some()
+                && library
+                    .liveness
+                    .is_none_or(|liveness| !liveness.is_dead(fc))
         });
     }
 
     fn known_movies(&self) -> impl Iterator<Item = Arc<SwfMovie>> {
-        self.0.keys()
+        self.0.values().filter_map(|library| library.swf.upgrade())
     }
 }
 
@@ -1106,10 +1107,15 @@ mod tests {
 
     #[test]
     fn expired_movie_keys_are_removed() {
-        let movie = Arc::new(SwfMovie::empty(10, None));
         let mut arena: TestArena = Arena::new(move |mc| {
             let mut library = Library::empty();
-            library.library_for_movie_mut(movie);
+            let movies = (0..64)
+                .map(|_| Arc::new(SwfMovie::empty(10, None)))
+                .collect::<Vec<_>>();
+            for movie in &movies {
+                library.library_for_movie_mut(movie.clone());
+            }
+            drop(movies);
             TestRoot(GcRefLock::new(
                 mc,
                 TestRootData {
@@ -1123,7 +1129,7 @@ mod tests {
 
         assert_eq!(
             arena.mutate(|_, root| root.0.borrow().library.movie_libraries.0.len()),
-            1
+            64
         );
         finish_collection(&mut arena);
         assert_eq!(
