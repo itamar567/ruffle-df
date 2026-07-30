@@ -326,3 +326,38 @@ struct GraphicShared {
     #[collect(require_static)]
     render_handles: Option<RefCell<TessellationCache>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gc_arena::{Arena, Rootable};
+
+    #[derive(Collect)]
+    #[collect(no_drop)]
+    struct TestRoot<'gc>(Graphic<'gc>);
+
+    #[test]
+    fn swf_graphic_starts_untessellated() {
+        let movie = Arc::new(SwfMovie::empty(10, None));
+        let shape = swf::Shape {
+            version: 1,
+            id: 1,
+            shape_bounds: Default::default(),
+            edge_bounds: Default::default(),
+            flags: swf::ShapeFlag::empty(),
+            styles: swf::ShapeStyles {
+                fill_styles: Vec::new(),
+                line_styles: Vec::new(),
+            },
+            shape: Vec::new(),
+        };
+        let arena: Arena<Rootable![TestRoot<'_>]> =
+            Arena::new(move |mc| TestRoot(Graphic::from_swf_tag(mc, shape, movie)));
+
+        arena.mutate(|_, root| {
+            let shared = root.0.0.shared.get();
+            let render_handles = shared.render_handles.as_ref().unwrap();
+            assert_eq!(render_handles.borrow().len(), 0);
+        });
+    }
+}
