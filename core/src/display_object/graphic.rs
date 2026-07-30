@@ -49,30 +49,24 @@ pub struct GraphicData<'gc> {
 impl<'gc> Graphic<'gc> {
     /// Construct a `Graphic` from it's associated `Shape` tag.
     pub fn from_swf_tag(
-        context: &mut UpdateContext<'gc>,
+        gc_context: &Mutation<'gc>,
         swf_shape: swf::Shape,
         movie: Arc<SwfMovie>,
     ) -> Self {
-        let library = context.library.library_for_movie(movie.clone()).unwrap();
         let shared = GraphicShared {
             id: swf_shape.id,
             shape_bounds: swf_shape.shape_bounds,
             edge_bounds: swf_shape.edge_bounds,
-            render_handle: Some(
-                context
-                    .renderer
-                    .register_shape((&swf_shape).into(), &MovieLibrarySource { library }),
-            ),
             shape: swf_shape,
             movie,
-            scaled_handle: RefCell::new(TessellationCache::new()),
+            render_handles: Some(RefCell::new(TessellationCache::new())),
         };
 
         Graphic(Gc::new(
-            context.gc(),
+            gc_context,
             GraphicData {
                 base: Default::default(),
-                shared: Lock::new(Gc::new(context.gc(), shared)),
+                shared: Lock::new(Gc::new(gc_context, shared)),
                 class: Lock::new(None),
                 avm2_object: Lock::new(None),
                 drawing: OnceCell::new(),
@@ -86,7 +80,6 @@ impl<'gc> Graphic<'gc> {
             id: 0,
             shape_bounds: Default::default(),
             edge_bounds: Default::default(),
-            render_handle: None,
             shape: swf::Shape {
                 version: 32,
                 id: 0,
@@ -100,7 +93,7 @@ impl<'gc> Graphic<'gc> {
                 shape: Vec::new(),
             },
             movie: context.root_swf.clone(),
-            scaled_handle: RefCell::new(TessellationCache::new()),
+            render_handles: None,
         };
 
         Graphic(Gc::new(
@@ -127,49 +120,38 @@ impl<'gc> Graphic<'gc> {
         unlock!(Gc::write(mc, self.0), GraphicData, shared).set(shared);
     }
 
-    /// Returns the best shape handle for the current scale, retessellating if necessary.
-    fn get_or_retessellate_handle(
+    /// Returns the best shape handle for the current scale, tessellating it on demand.
+    fn get_or_register_handle(
         self,
         context: &mut RenderContext,
-        base_handle: &ShapeHandle,
         current_scale: f32,
-    ) -> ShapeHandle {
-        // Since graphics are created from a shared shape, we may be able to reuse a
-        // cached tessellation from another instance at a similar scale.
+    ) -> Option<ShapeHandle> {
         let shared = self.0.shared.get();
+        let render_handles = shared.render_handles.as_ref()?;
 
+        if let Some(handle) = render_handles
+            .borrow_mut()
+            .find_near_and_touch(current_scale)
         {
-            let mut cache = shared.scaled_handle.borrow_mut();
-            if let Some(handle) = cache.find_near_and_touch(current_scale) {
-                // Found a cached handle at a similar scale; reuse it.
-                return handle;
-            }
+            return Some(handle);
         }
 
-        // Retessellate at the new scale
-        let library = context.library.library_for_movie(shared.movie.clone());
-        if let Some(library) = library {
-            let new_handle = context.renderer.register_shape_with_scale(
-                (&shared.shape).into(),
-                &MovieLibrarySource { library },
-                current_scale,
-            );
+        let library = context.library.library_for_movie(shared.movie.clone())?;
+        let new_handle = context.renderer.register_shape_with_scale(
+            (&shared.shape).into(),
+            &MovieLibrarySource { library },
+            current_scale,
+        );
 
-            {
-                let mut cache = shared.scaled_handle.borrow_mut();
-                tracing::debug!(
-                    "Graphic id={} retessellated: new_scale={:.2}, cache_size={}",
-                    shared.id,
-                    current_scale,
-                    cache.len()
-                );
-                cache.insert(current_scale, new_handle.clone());
-            }
-
-            new_handle
-        } else {
-            base_handle.clone()
-        }
+        let mut render_handles = render_handles.borrow_mut();
+        tracing::debug!(
+            "Graphic id={} tessellated: scale={:.2}, cache_size={}",
+            shared.id,
+            current_scale,
+            render_handles.len()
+        );
+        render_handles.insert(current_scale, new_handle.clone());
+        Some(new_handle)
     }
 }
 
@@ -255,7 +237,7 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
 
         if let Some(drawing) = self.0.drawing.get() {
             drawing.borrow().render(context);
-        } else if let Some(base_handle) = self.0.shared.get().render_handle.clone() {
+        } else {
             let transform = context.transform_stack.transform();
 
             // Calculate the current scale from the transform, to determine if
@@ -265,9 +247,9 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
             let scale_y = f32::abs(matrix.b + matrix.d);
             let current_scale = ((scale_x * scale_x + scale_y * scale_y) / 2.0).sqrt();
 
-            let handle = self.get_or_retessellate_handle(context, &base_handle, current_scale);
-
-            context.commands.render_shape(handle, transform)
+            if let Some(handle) = self.get_or_register_handle(context, current_scale) {
+                context.commands.render_shape(handle, transform);
+            }
         }
     }
 
@@ -338,10 +320,9 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
 struct GraphicShared {
     id: CharacterId,
     shape: swf::Shape,
-    render_handle: Option<ShapeHandle>,
     shape_bounds: Rectangle<Twips>,
     edge_bounds: Rectangle<Twips>,
     movie: Arc<SwfMovie>,
     #[collect(require_static)]
-    scaled_handle: RefCell<TessellationCache>,
+    render_handles: Option<RefCell<TessellationCache>>,
 }

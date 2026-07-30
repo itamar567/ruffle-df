@@ -110,3 +110,71 @@ impl TessellationCache {
         entry.1
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ruffle_render::backend::ShapeHandleImpl;
+    use std::any::Any;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct TestShapeHandle(u8);
+
+    impl ShapeHandleImpl for TestShapeHandle {}
+
+    fn shape_handle(id: u8) -> ShapeHandle {
+        ShapeHandle(Arc::new(TestShapeHandle(id)))
+    }
+
+    fn handle_id(handle: ShapeHandle) -> u8 {
+        <dyn Any>::downcast_ref::<TestShapeHandle>(&*handle.0)
+            .expect("test shape handle")
+            .0
+    }
+
+    #[test]
+    fn empty_cache_misses() {
+        let mut cache = TessellationCache::new();
+
+        assert!(cache.find_near_and_touch(1.0).is_none());
+    }
+
+    #[test]
+    fn compatible_scale_reuses_closest_handle() {
+        let mut cache = TessellationCache::new();
+        cache.insert(1.0, shape_handle(1));
+        cache.insert(3.0, shape_handle(2));
+
+        assert_eq!(handle_id(cache.find_near_and_touch(1.4).unwrap()), 1);
+        assert_eq!(handle_id(cache.find_near_and_touch(2.0).unwrap()), 2);
+    }
+
+    #[test]
+    fn scale_threshold_is_inclusive() {
+        let mut cache = TessellationCache::new();
+        cache.insert(1.0, shape_handle(1));
+
+        assert!(cache.find_near_and_touch(0.5).is_some());
+        assert!(cache.find_near_and_touch(2.0).is_some());
+        assert!(cache.find_near_and_touch(0.49).is_none());
+        assert!(cache.find_near_and_touch(2.01).is_none());
+    }
+
+    #[test]
+    fn touching_an_entry_prevents_its_eviction() {
+        let mut cache = TessellationCache::new();
+        for id in 1..=4 {
+            cache.insert(id as f32, shape_handle(id));
+        }
+
+        assert_eq!(handle_id(cache.touch_entry(0)), 1);
+        cache.insert(16.0, shape_handle(5));
+
+        let ids: Vec<_> = cache.entries[..cache.len]
+            .iter()
+            .map(|entry| handle_id(entry.as_ref().unwrap().1.clone()))
+            .collect();
+        assert_eq!(ids, vec![3, 4, 1, 5]);
+    }
+}
