@@ -466,13 +466,15 @@ impl<'gc> MovieLibraries<'gc> {
             .or_insert_with(|| MovieLibrary::new(&movie))
     }
 
-    fn remove_dead(&mut self, fc: &Finalization<'gc>) {
+    fn remove_dead(&mut self, fc: &Finalization<'gc>) -> bool {
+        let previous_len = self.0.len();
         self.0.retain(|_, library| {
             library.swf.upgrade().is_some()
                 && library
                     .liveness
                     .is_none_or(|liveness| !liveness.is_dead(fc))
         });
+        self.0.len() != previous_len
     }
 
     fn known_movies(&self) -> impl Iterator<Item = Arc<SwfMovie>> {
@@ -570,8 +572,8 @@ impl<'gc> Library<'gc> {
         }
     }
 
-    pub(crate) fn remove_dead_movie_libraries(&mut self, fc: &Finalization<'gc>) {
-        self.movie_libraries.remove_dead(fc);
+    pub(crate) fn remove_dead_movie_libraries(&mut self, fc: &Finalization<'gc>) -> bool {
+        self.movie_libraries.remove_dead(fc)
     }
 
     /// Returns the default Font implementations behind the built in names (ie `_sans`)
@@ -948,14 +950,25 @@ mod tests {
 
     type TestArena = Arena<Rootable![TestRoot<'_>]>;
 
-    fn finish_collection(arena: &mut TestArena) {
-        arena.finish_marking().unwrap().finalize(|fc, root| {
+    fn finish_collection(arena: &mut TestArena) -> bool {
+        let removed = arena.finish_marking().unwrap().finalize(|fc, root| {
             root.0
                 .borrow_mut(fc)
                 .library
                 .remove_dead_movie_libraries(fc)
         });
         arena.finish_cycle();
+        removed
+    }
+
+    fn finish_collections_until_stable(arena: &mut TestArena) -> usize {
+        let mut cycles = 0;
+        loop {
+            cycles += 1;
+            if !finish_collection(arena) {
+                return cycles;
+            }
+        }
     }
 
     fn library_count(arena: &TestArena) -> usize {
@@ -995,7 +1008,7 @@ mod tests {
     fn live_movie_liveness_retains_library() {
         let (mut arena, weak_movie) = arena_with_movie(true, false);
 
-        finish_collection(&mut arena);
+        assert!(!finish_collection(&mut arena));
 
         assert_eq!(library_count(&arena), 1);
         assert!(weak_movie.upgrade().is_some());
@@ -1005,15 +1018,24 @@ mod tests {
     fn instantiated_character_retains_library() {
         let (mut arena, weak_movie) = arena_with_movie(false, true);
 
-        finish_collection(&mut arena);
+        assert!(!finish_collection(&mut arena));
         assert_eq!(library_count(&arena), 1);
 
         arena.mutate(|mc, root| root.0.borrow_mut(mc).object = None);
-        finish_collection(&mut arena);
+        assert!(finish_collection(&mut arena));
         assert_eq!(library_count(&arena), 0);
         assert!(weak_movie.upgrade().is_some());
 
-        finish_collection(&mut arena);
+        assert!(!finish_collection(&mut arena));
+        assert!(weak_movie.upgrade().is_none());
+    }
+
+    #[test]
+    fn forced_movie_collection_reclaims_removed_library_contents() {
+        let (mut arena, weak_movie) = arena_with_movie(false, false);
+
+        assert_eq!(finish_collections_until_stable(&mut arena), 2);
+        assert_eq!(library_count(&arena), 0);
         assert!(weak_movie.upgrade().is_none());
     }
 
@@ -1023,12 +1045,13 @@ mod tests {
         let movie_b = Arc::new(SwfMovie::empty(10, None));
         let weak_movie_a = Arc::downgrade(&movie_a);
         let weak_movie_b = Arc::downgrade(&movie_b);
-        let mut arena = Arena::new(move |mc| {
+        let mut arena: TestArena = Arena::new(move |mc| {
             let mut library = Library::empty();
             let owner: DisplayObject = MovieClip::new(movie_a.clone(), mc).into();
 
+            assert!(!owner.has_movie_library_liveness());
             library.activate_movie(movie_a.clone(), owner, mc);
-            library.activate_movie(movie_b.clone(), owner, mc);
+            assert!(owner.has_movie_library_liveness());
             library
                 .library_for_movie_mut(movie_a.clone())
                 .register_character(1, Character::MovieClip(MovieClip::new(movie_a, mc)));
@@ -1047,7 +1070,16 @@ mod tests {
             ))
         });
 
-        finish_collection(&mut arena);
+        arena.finish_marking().unwrap().finalize(|_, _| {});
+        arena.mutate(|mc, root| {
+            let mut data = root.0.borrow_mut(mc);
+            let owner = data.object.unwrap();
+            data.library
+                .activate_movie(weak_movie_b.upgrade().unwrap(), owner, mc);
+        });
+
+        assert!(!finish_collection(&mut arena));
+        assert!(finish_collection(&mut arena));
 
         arena.mutate(|_, root| {
             let data = root.0.borrow();
@@ -1062,6 +1094,8 @@ mod tests {
                     .is_some()
             );
         });
+
+        assert!(!finish_collection(&mut arena));
     }
 
     #[test]
@@ -1097,10 +1131,10 @@ mod tests {
             ))
         });
 
-        finish_collection(&mut arena);
+        assert!(finish_collection(&mut arena));
         assert_eq!(library_count(&arena), 0);
 
-        finish_collection(&mut arena);
+        assert!(!finish_collection(&mut arena));
         assert!(weak_movie_a.upgrade().is_none());
         assert!(weak_movie_b.upgrade().is_none());
     }
@@ -1131,7 +1165,7 @@ mod tests {
             arena.mutate(|_, root| root.0.borrow().library.movie_libraries.0.len()),
             64
         );
-        finish_collection(&mut arena);
+        assert!(finish_collection(&mut arena));
         assert_eq!(
             arena.mutate(|_, root| root.0.borrow().library.movie_libraries.0.len()),
             0

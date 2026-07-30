@@ -384,6 +384,10 @@ impl<'gc> MovieClip<'gc> {
         is_root: bool,
         loader_info: Option<LoaderInfoObject<'gc>>,
     ) {
+        if DisplayObject::from(self).has_movie_library_liveness() {
+            context.request_movie_gc();
+        }
+
         let write = Gc::write(context.gc(), self.0);
         let movie =
             movie.unwrap_or_else(|| Arc::new(SwfMovie::empty(write.movie().version(), None)));

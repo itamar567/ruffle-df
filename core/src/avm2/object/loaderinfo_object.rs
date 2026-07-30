@@ -282,6 +282,7 @@ impl<'gc> LoaderInfoObject<'gc> {
 
         // Remove the Loader's content element if it exists.
         if let Some(child) = loader.child_by_index(0) {
+            context.request_movie_gc();
             loader.remove_child(context, child);
         }
     }

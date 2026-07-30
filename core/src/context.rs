@@ -89,6 +89,8 @@ pub struct UpdateContext<'gc> {
     /// Requests that the player re-renders after this execution (e.g. due to `updateAfterEvent`).
     pub needs_render: &'gc mut bool,
 
+    pub(crate) movie_gc_requested: &'gc mut bool,
+
     /// The root SWF file.
     pub root_swf: &'gc mut Arc<SwfMovie>,
 
@@ -246,6 +248,10 @@ impl<'gc> HasStringContext<'gc> for UpdateContext<'gc> {
 
 /// Convenience methods for controlling audio.
 impl<'gc> UpdateContext<'gc> {
+    pub(crate) fn request_movie_gc(&mut self) {
+        *self.movie_gc_requested = true;
+    }
+
     pub fn global_sound_transform(&self) -> &SoundTransform {
         self.audio_manager.global_sound_transform()
     }

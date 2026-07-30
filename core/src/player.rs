@@ -59,8 +59,9 @@ use crate::timer::Timers;
 use crate::vminterface::Instantiator;
 use async_channel::Sender;
 use enumset::EnumSet;
+use gc_arena::arena::CollectionPhase;
 use gc_arena::lock::GcRefLock;
-use gc_arena::{Collect, DynamicRootSet, Mutation, Rootable};
+use gc_arena::{Collect, DynamicRootSet, Finalization, Mutation, Rootable};
 use ruffle_common::duration::FloatDuration;
 use ruffle_macros::istr;
 use ruffle_render::backend::{RenderBackend, ViewportDimensions, null::NullRenderer};
@@ -308,6 +309,7 @@ pub struct Player {
 
     run_state: RunState,
     needs_render: bool,
+    movie_gc_requested: bool,
 
     renderer: Box<dyn RenderBackend>,
     audio: Box<dyn AudioBackend>,
@@ -2295,6 +2297,7 @@ impl Player {
                 timers,
                 current_context_menu,
                 needs_render: &mut this.needs_render,
+                movie_gc_requested: &mut this.movie_gc_requested,
                 avm1,
                 avm2,
                 external_interface,
@@ -2359,6 +2362,59 @@ impl Player {
         self.debug_ui.borrow_mut()
     }
 
+    fn remove_dead_movie_libraries<'gc>(
+        fc: &'gc Finalization<'gc>,
+        root: &'gc GcRoot<'gc>,
+    ) -> bool {
+        root.data
+            .borrow_mut(fc)
+            .library
+            .remove_dead_movie_libraries(fc)
+    }
+
+    fn finish_gc_cycle(arena: &mut GcArena) -> bool {
+        let removed = arena
+            .finish_marking()
+            .expect("GC marking must finish outside the sweeping phase")
+            .finalize(Self::remove_dead_movie_libraries);
+        arena.finish_cycle();
+        removed
+    }
+
+    /// Completes any in-progress cycle before collecting dead movie libraries.
+    fn finish_movie_gc(arena: &mut GcArena) {
+        match arena.collection_phase() {
+            CollectionPhase::Sleeping => {}
+            CollectionPhase::Sweeping => arena.finish_cycle(),
+            CollectionPhase::Marking | CollectionPhase::Marked => {
+                Self::finish_gc_cycle(arena);
+            }
+        }
+
+        // Removing a library only unroots its already-marked contents, loop until we collect everything
+        while Self::finish_gc_cycle(arena) { }
+    }
+
+    fn collect_garbage(&mut self) {
+        let movie_gc_requested = std::mem::take(&mut self.movie_gc_requested);
+        let mut arena = self.gc_arena.borrow_mut();
+
+        if movie_gc_requested {
+            Self::finish_movie_gc(&mut arena);
+            return;
+        }
+
+        if let Some(marked) = arena.mark_debt() {
+            let removed = marked.finalize(Self::remove_dead_movie_libraries);
+            if removed {
+                arena.finish_cycle();
+                Self::finish_movie_gc(&mut arena);
+                return;
+            }
+        }
+        arena.cycle_debt();
+    }
+
     /// Update the current state of the player.
     ///
     /// The given function will be called with the current stage root, current
@@ -2385,16 +2441,7 @@ impl Player {
         });
         self.update_mouse_state(EnumSet::empty(), false, &mut false);
 
-        let mut arena = self.gc_arena.borrow_mut();
-        if let Some(marked) = arena.mark_debt() {
-            marked.finalize(|fc, root| {
-                root.data
-                    .borrow_mut(fc)
-                    .library
-                    .remove_dead_movie_libraries(fc);
-            });
-        }
-        arena.cycle_debt();
+        self.collect_garbage();
 
         rval
     }
@@ -3052,6 +3099,7 @@ impl PlayerBuilder {
                     RunState::Suspended
                 },
                 needs_render: true,
+                movie_gc_requested: false,
                 self_reference: self_ref.clone(),
                 load_behavior: self.load_behavior,
                 spoofed_url: self.spoofed_url.clone(),
