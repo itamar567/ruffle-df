@@ -456,7 +456,17 @@ impl SwfMovie {
     }
 
     pub fn compressed_len(&self) -> usize {
-        self.data.compressed_len().unwrap_or(self.compressed_len)
+        let known_len = self.data.compressed_len().unwrap_or(self.compressed_len);
+        if !self.is_streaming() {
+            return known_len;
+        }
+
+        let total_len = if known_len == 0 {
+            usize::try_from(self.uncompressed_len()).unwrap_or_default()
+        } else {
+            known_len
+        };
+        total_len.max(self.compressed_loaded_len())
     }
 
     pub fn uncompressed_len(&self) -> i32 {
@@ -652,6 +662,27 @@ impl SwfSlice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_compressed_total_never_trails_loaded_bytes() {
+        let movie = SwfMovie::from_streaming(
+            HeaderExt::default_with_uncompressed_len(100, Rectangle::ZERO),
+            4,
+            "https://example.com/movie.swf".to_string(),
+            None,
+            None,
+        );
+
+        assert_eq!(movie.compressed_len(), 100);
+        movie.append_data(&[1, 2], 5);
+        assert_eq!(movie.compressed_len(), 100);
+        assert_eq!(movie.compressed_loaded_len(), 5);
+
+        movie.append_data(&[3, 4], 9);
+        assert_eq!(movie.compressed_len(), 100);
+        movie.finish_data(11);
+        assert_eq!(movie.compressed_len(), 11);
+    }
 
     #[test]
     fn streaming_slice_grows_without_moving_published_bytes() {
