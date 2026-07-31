@@ -45,6 +45,10 @@ use web_sys::{
 
 static RUFFLE_GLOBAL_PANIC: Once = Once::new();
 
+fn is_touch_pointer(pointer_type: &str) -> bool {
+    pointer_type == "touch"
+}
+
 new_key_type! {
     /// An opaque handle to a `RuffleInstance` inside the pool.
     ///
@@ -695,6 +699,7 @@ impl RuffleHandle {
                 false,
                 move |js_event: PointerEvent| {
                     let _ = ruffle.with_instance(|instance| {
+                        let is_touch = is_touch_pointer(&js_event.pointer_type());
                         if let Some(target) = js_event.current_target() {
                             let _ = target
                                 .unchecked_ref::<Element>()
@@ -712,6 +717,10 @@ impl RuffleHandle {
                         };
                         let _ = instance.with_core_mut(|core| {
                             core.handle_event(event);
+                            if is_touch {
+                                core.set_mouse_in_stage(false);
+                                core.handle_event(PlayerEvent::MouseLeave);
+                            }
                         });
 
                         if instance.has_focus {
@@ -1414,4 +1423,16 @@ fn global_init() {
     }));
 
     tracing::info!("Ruffle WASM module has been initialized");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_touch_pointer;
+
+    #[test]
+    fn identifies_touch_pointer_type() {
+        assert!(is_touch_pointer("touch"));
+        assert!(!is_touch_pointer("mouse"));
+        assert!(!is_touch_pointer("pen"));
+    }
 }
