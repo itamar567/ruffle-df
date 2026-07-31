@@ -62,7 +62,7 @@ pub use loader_display::LoaderDisplay;
 pub use morph_shape::MorphShape;
 pub use movie_clip::{MovieClip, MovieClipHandle, MovieClipWeak, Scene};
 use ruffle_render::backend::{BitmapCacheEntry, RenderBackend};
-use ruffle_render::bitmap::{BitmapHandle, BitmapInfo, PixelSnapping};
+use ruffle_render::bitmap::{BitmapHandle, BitmapInfo, PixelRegion, PixelSnapping};
 use ruffle_render::blend::ExtendedBlendMode;
 use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::filters::Filter;
@@ -1242,12 +1242,22 @@ pub fn apply_standard_mask_and_scroll<'gc, F>(
 
     if let RenderMask::Alpha(m) = mask {
         let original_commands = std::mem::take(&mut context.commands);
+        let maskee_bounds = PixelRegion::from(this.render_bounds_with_transform(
+            &context.transform_stack.transform().matrix,
+            true,
+            &context.stage.view_matrix(),
+        ));
 
         draw(context);
 
         let maskee_commands = std::mem::take(&mut context.commands);
 
         context.transform_stack.push(&mask_transform);
+        let mask_bounds = PixelRegion::from(m.render_bounds_with_transform(
+            &context.transform_stack.transform().matrix,
+            true,
+            &context.stage.view_matrix(),
+        ));
         let options = RenderOptions {
             skip_masks: false,
             apply_matrix: false,
@@ -1257,10 +1267,11 @@ pub fn apply_standard_mask_and_scroll<'gc, F>(
         context.transform_stack.pop();
 
         let mask_commands = std::mem::replace(&mut context.commands, original_commands);
+        let bounds = maskee_bounds.intersection(mask_bounds);
 
         context
             .commands
-            .render_alpha_mask(maskee_commands, mask_commands);
+            .render_alpha_mask(maskee_commands, mask_commands, bounds);
     } else {
         draw(context);
     }

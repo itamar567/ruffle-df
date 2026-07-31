@@ -15,7 +15,12 @@ pub trait CommandHandler {
     );
     fn render_stage3d(&mut self, bitmap: BitmapHandle, transform: Transform);
     fn render_shape(&mut self, shape: ShapeHandle, transform: Transform);
-    fn render_alpha_mask(&mut self, maskee_commands: CommandList, mask_commands: CommandList);
+    fn render_alpha_mask(
+        &mut self,
+        maskee_commands: CommandList,
+        mask_commands: CommandList,
+        bounds: PixelRegion,
+    );
     fn draw_rect(&mut self, color: Color, matrix: Matrix);
     fn draw_line(&mut self, color: Color, matrix: Matrix);
     fn draw_line_rect(&mut self, color: Color, matrix: Matrix);
@@ -86,7 +91,8 @@ impl CommandList {
                 Command::RenderAlphaMask {
                     maskee_commands,
                     mask_commands,
-                } => handler.render_alpha_mask(maskee_commands, mask_commands),
+                    bounds,
+                } => handler.render_alpha_mask(maskee_commands, mask_commands, bounds),
             }
         }
     }
@@ -131,11 +137,17 @@ impl CommandHandler for CommandList {
         }
     }
 
-    fn render_alpha_mask(&mut self, maskee_commands: CommandList, mask_commands: CommandList) {
+    fn render_alpha_mask(
+        &mut self,
+        maskee_commands: CommandList,
+        mask_commands: CommandList,
+        bounds: PixelRegion,
+    ) {
         if self.maskers_in_progress <= 1 {
             self.commands.push(Command::RenderAlphaMask {
                 maskee_commands,
                 mask_commands,
+                bounds,
             });
         }
     }
@@ -224,6 +236,7 @@ pub enum Command {
     RenderAlphaMask {
         maskee_commands: CommandList,
         mask_commands: CommandList,
+        bounds: PixelRegion,
     },
     DrawRect {
         color: Color,

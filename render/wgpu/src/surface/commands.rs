@@ -918,11 +918,20 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         self.current.push(DrawCommand::PopMask);
     }
 
-    fn render_alpha_mask(&mut self, maskee_commands: CommandList, mask_commands: CommandList) {
+    fn render_alpha_mask(
+        &mut self,
+        maskee_commands: CommandList,
+        mask_commands: CommandList,
+        bounds: PixelRegion,
+    ) {
+        let viewport = bounds.intersection(self.viewport);
+        if viewport.width() == 0 || viewport.height() == 0 {
+            return;
+        }
         let surface = Surface::for_viewport(
             self.descriptors,
             self.quality,
-            self.viewport,
+            viewport,
             wgpu::TextureFormat::Rgba8Unorm,
         );
 
@@ -941,8 +950,8 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         let matrix = Matrix {
             a: maskee.width() as f32,
             d: maskee.height() as f32,
-            tx: Twips::from_pixels(self.viewport.x_min as f64),
-            ty: Twips::from_pixels(self.viewport.y_min as f64),
+            tx: Twips::from_pixels(viewport.x_min as f64),
+            ty: Twips::from_pixels(viewport.y_min as f64),
             ..Default::default()
         };
         let maskee = maskee.take_color_texture();

@@ -1562,7 +1562,12 @@ impl CommandHandler for WebGlRenderBackend {
         self.pop_blend_mode();
     }
 
-    fn render_alpha_mask(&mut self, maskee_commands: CommandList, _mask_commands: CommandList) {
+    fn render_alpha_mask(
+        &mut self,
+        maskee_commands: CommandList,
+        _mask_commands: CommandList,
+        _bounds: PixelRegion,
+    ) {
         // TODO Add support for alpha masks
         maskee_commands.execute(self);
     }
