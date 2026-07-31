@@ -1068,12 +1068,13 @@ impl Player {
     /// 4. If the incoming event is text input, and neither step 3 nor step 4
     ///    resulted in an event being handled, we dispatch a text input event
     ///    to the currently focused `EditText` (if present).
-    /// 5. Regardless of all prior event handling, we dispatch the event
+    /// 5. Mouse position is updated before dispatching mouse events.
+    /// 6. Regardless of all prior event handling, we dispatch the event
     ///    through the stage normally.
-    /// 6. Then, we dispatch the event through AVM1 global listener objects.
-    /// 7. The AVM1 action queue is drained.
-    /// 8. Mouse state is updated. This triggers button rollovers, which are a
-    ///    second wave of event processing.
+    /// 7. Then, we dispatch the event through AVM1 global listener objects.
+    /// 8. The AVM1 action queue is drained.
+    /// 9. Mouse button and hover state is updated. This triggers button
+    ///    rollovers, which are a second wave of event processing.
     fn handle_input_event(&mut self, event: PlayerEvent) -> bool {
         let mut player_event_handled = false;
         let prev_mouse_buttons = self.input.get_mouse_down_buttons();
@@ -1086,6 +1087,18 @@ impl Player {
             .get_mouse_down_buttons()
             .symmetric_difference(prev_mouse_buttons);
         let mouse_input_source = self.input.mouse_input_source();
+        let prev_mouse_position = match &event {
+            InputEvent::MouseMove { x, y, .. }
+            | InputEvent::MouseDown { x, y, .. }
+            | InputEvent::MouseUp { x, y, .. } => {
+                let prev_mouse_position = self.mouse_position;
+                let inverse_view_matrix =
+                    self.mutate_with_update_context(|context| context.stage.inverse_view_matrix());
+                self.mouse_position = inverse_view_matrix * Point::from_pixels(*x, *y);
+                Some(prev_mouse_position)
+            }
+            _ => None,
+        };
 
         if cfg!(feature = "avm_debug") {
             match event {
@@ -1381,15 +1394,7 @@ impl Player {
         });
 
         // Update mouse state.
-        if let InputEvent::MouseMove { x, y, .. }
-        | InputEvent::MouseDown { x, y, .. }
-        | InputEvent::MouseUp { x, y, .. } = event
-        {
-            let inverse_view_matrix =
-                self.mutate_with_update_context(|context| context.stage.inverse_view_matrix());
-            let prev_mouse_position = self.mouse_position;
-            self.mouse_position = inverse_view_matrix * Point::from_pixels(x, y);
-
+        if let Some(prev_mouse_position) = prev_mouse_position {
             // Update the dragged object here to keep it constantly in sync with the mouse position.
             self.mutate_with_update_context(|context| {
                 Self::update_drag(context);
