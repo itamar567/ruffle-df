@@ -49,6 +49,15 @@ fn is_touch_pointer(pointer_type: &str) -> bool {
     pointer_type == "touch"
 }
 
+fn pointer_button(button: i16) -> MouseButton {
+    match button {
+        0 => MouseButton::Left,
+        1 => MouseButton::Middle,
+        2 => MouseButton::Right,
+        _ => MouseButton::Unknown,
+    }
+}
+
 new_key_type! {
     /// An opaque handle to a `RuffleInstance` inside the pool.
     ///
@@ -135,6 +144,7 @@ struct RuffleInstance {
     mouse_leave_callback: Option<JsCallback<PointerEvent>>,
     mouse_down_callback: Option<JsCallback<PointerEvent>>,
     mouse_up_callback: Option<JsCallback<PointerEvent>>,
+    pointer_cancel_callback: Option<JsCallback<PointerEvent>>,
     mouse_wheel_callback: Option<JsCallback<WheelEvent>>,
     key_down_callback: Option<JsCallback<KeyboardEvent>>,
     key_up_callback: Option<JsCallback<KeyboardEvent>>,
@@ -149,6 +159,36 @@ struct RuffleInstance {
     trace_observer: Rc<RefCell<JsValue>>,
     log_subscriber: Arc<Layered<WASMLayer, Registry>>,
     pressed_buttons: Vec<GamepadButton>,
+}
+
+fn release_pointer(
+    instance: &RuffleInstance,
+    event: &PointerEvent,
+    button: MouseButton,
+    leave_stage: bool,
+) {
+    if let Some(target) = event.current_target() {
+        let _ = target
+            .unchecked_ref::<Element>()
+            .release_pointer_capture(event.pointer_id());
+    }
+
+    let player_event = PlayerEvent::MouseUp {
+        x: event.offset_x() * instance.device_pixel_ratio,
+        y: event.offset_y() * instance.device_pixel_ratio,
+        button,
+    };
+    let _ = instance.with_core_mut(|core| {
+        core.handle_event(player_event);
+        if leave_stage {
+            core.set_mouse_in_stage(false);
+            core.handle_event(PlayerEvent::MouseLeave);
+        }
+    });
+
+    if instance.has_focus {
+        event.prevent_default();
+    }
 }
 
 #[wasm_bindgen(raw_module = "./internal/player/inner")]
@@ -562,6 +602,7 @@ impl RuffleHandle {
             mouse_leave_callback: None,
             mouse_down_callback: None,
             mouse_up_callback: None,
+            pointer_cancel_callback: None,
             mouse_wheel_callback: None,
             key_down_callback: None,
             key_up_callback: None,
@@ -666,12 +707,7 @@ impl RuffleHandle {
                                 .set_pointer_capture(js_event.pointer_id());
                         }
                         let device_pixel_ratio = instance.device_pixel_ratio;
-                        let button = match js_event.button() {
-                            0 => MouseButton::Left,
-                            1 => MouseButton::Middle,
-                            2 => MouseButton::Right,
-                            _ => MouseButton::Unknown,
-                        };
+                        let button = pointer_button(js_event.button());
                         let event = PlayerEvent::MouseDown {
                             x: js_event.offset_x() * device_pixel_ratio,
                             y: js_event.offset_y() * device_pixel_ratio,
@@ -699,33 +735,23 @@ impl RuffleHandle {
                 false,
                 move |js_event: PointerEvent| {
                     let _ = ruffle.with_instance(|instance| {
-                        let is_touch = is_touch_pointer(&js_event.pointer_type());
-                        if let Some(target) = js_event.current_target() {
-                            let _ = target
-                                .unchecked_ref::<Element>()
-                                .release_pointer_capture(js_event.pointer_id());
-                        }
-                        let event = PlayerEvent::MouseUp {
-                            x: js_event.offset_x() * instance.device_pixel_ratio,
-                            y: js_event.offset_y() * instance.device_pixel_ratio,
-                            button: match js_event.button() {
-                                0 => MouseButton::Left,
-                                1 => MouseButton::Middle,
-                                2 => MouseButton::Right,
-                                _ => MouseButton::Unknown,
-                            },
-                        };
-                        let _ = instance.with_core_mut(|core| {
-                            core.handle_event(event);
-                            if is_touch {
-                                core.set_mouse_in_stage(false);
-                                core.handle_event(PlayerEvent::MouseLeave);
-                            }
-                        });
+                        release_pointer(
+                            instance,
+                            &js_event,
+                            pointer_button(js_event.button()),
+                            is_touch_pointer(&js_event.pointer_type()),
+                        );
+                    });
+                },
+            ));
 
-                        if instance.has_focus {
-                            js_event.prevent_default();
-                        }
+            instance.pointer_cancel_callback = Some(JsCallback::register(
+                &player.canvas,
+                "pointercancel",
+                false,
+                move |js_event: PointerEvent| {
+                    let _ = ruffle.with_instance(|instance| {
+                        release_pointer(instance, &js_event, MouseButton::Left, true);
                     });
                 },
             ));
@@ -1427,12 +1453,22 @@ fn global_init() {
 
 #[cfg(test)]
 mod tests {
-    use super::is_touch_pointer;
+    use super::{is_touch_pointer, pointer_button};
+    use ruffle_core::events::MouseButton;
 
     #[test]
     fn identifies_touch_pointer_type() {
         assert!(is_touch_pointer("touch"));
         assert!(!is_touch_pointer("mouse"));
         assert!(!is_touch_pointer("pen"));
+    }
+
+    #[test]
+    fn maps_pointer_buttons() {
+        assert_eq!(pointer_button(0), MouseButton::Left);
+        assert_eq!(pointer_button(1), MouseButton::Middle);
+        assert_eq!(pointer_button(2), MouseButton::Right);
+        assert_eq!(pointer_button(-1), MouseButton::Unknown);
+        assert_eq!(pointer_button(3), MouseButton::Unknown);
     }
 }
