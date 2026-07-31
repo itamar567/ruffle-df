@@ -10,7 +10,7 @@ use anyhow::Error;
 use gilrs::{Event, EventType, Gilrs};
 use ruffle_core::FloatDuration;
 use ruffle_core::PlayerEvent;
-use ruffle_core::events::{ImeEvent, ImeNotification, PlayerNotification};
+use ruffle_core::events::{ImeEvent, ImeNotification, MouseInputSource, PlayerNotification};
 use ruffle_core::swf::HeaderExt;
 use ruffle_frontend_utils::content::ContentDescriptor;
 use ruffle_render::backend::ViewportDimensions;
@@ -101,7 +101,11 @@ impl MainWindow {
 
                 self.mouse_pos = position;
                 let (x, y) = self.gui.window_to_movie_position(position);
-                let event = PlayerEvent::MouseMove { x, y };
+                let event = PlayerEvent::MouseMove {
+                    x,
+                    y,
+                    source: MouseInputSource::Mouse,
+                };
                 self.player.handle_event(event);
                 self.check_redraw();
             }
@@ -142,8 +146,14 @@ impl MainWindow {
                         y,
                         button,
                         index: None,
+                        source: MouseInputSource::Mouse,
                     },
-                    ElementState::Released => PlayerEvent::MouseUp { x, y, button },
+                    ElementState::Released => PlayerEvent::MouseUp {
+                        x,
+                        y,
+                        button,
+                        source: MouseInputSource::Mouse,
+                    },
                 };
                 let handled = self.player.handle_event(event);
                 if !handled && state == ElementState::Pressed && button == RuffleMouseButton::Right
@@ -158,6 +168,7 @@ impl MainWindow {
                             x,
                             y,
                             button: RuffleMouseButton::Right,
+                            source: MouseInputSource::Mouse,
                         };
                         self.gui.show_context_menu(context_menu, close_event);
                     }

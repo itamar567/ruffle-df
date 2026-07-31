@@ -17,17 +17,20 @@ pub enum PlayerEvent {
     MouseMove {
         x: f64,
         y: f64,
+        source: MouseInputSource,
     },
     MouseUp {
         x: f64,
         y: f64,
         button: MouseButton,
+        source: MouseInputSource,
     },
     MouseDown {
         x: f64,
         y: f64,
         button: MouseButton,
         index: Option<usize>,
+        source: MouseInputSource,
     },
     MouseLeave,
     MouseWheel {
@@ -650,6 +653,18 @@ impl KeyCode {
     #[inline]
     pub const fn value(self) -> u32 {
         self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseInputSource {
+    Mouse,
+    Touch,
+}
+
+impl MouseInputSource {
+    pub const fn supports_hover(self) -> bool {
+        matches!(self, Self::Mouse)
     }
 }
 

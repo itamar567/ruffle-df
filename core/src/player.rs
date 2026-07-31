@@ -34,7 +34,9 @@ use crate::display_object::{
 };
 use crate::events::GamepadButton;
 use crate::events::PlayerNotification;
-use crate::events::{ButtonKeyCode, ClipEvent, ClipEventResult, KeyCode, MouseButton, PlayerEvent};
+use crate::events::{
+    ButtonKeyCode, ClipEvent, ClipEventResult, KeyCode, MouseButton, MouseInputSource, PlayerEvent,
+};
 use crate::external::{ExternalInterface, ExternalInterfaceProvider, NullFsCommandProvider};
 use crate::external::{FsCommandProvider, Value as ExternalValue};
 use crate::focus_tracker::NavigationDirection;
@@ -82,6 +84,14 @@ use web_time::Instant;
 
 #[cfg(feature = "default_font")]
 pub const FALLBACK_DEVICE_FONT: &[u8] = include_bytes!("../assets/notosans.subset.ttf.gz");
+
+fn should_suppress_hover_events(
+    input_source: MouseInputSource,
+    is_dragging: bool,
+    is_action_script_3: bool,
+) -> bool {
+    !input_source.supports_hover() || is_dragging && !is_action_script_3
+}
 
 #[derive(Collect)]
 #[collect(no_drop)]
@@ -1075,6 +1085,7 @@ impl Player {
             .input
             .get_mouse_down_buttons()
             .symmetric_difference(prev_mouse_buttons);
+        let mouse_input_source = self.input.mouse_input_source();
 
         if cfg!(feature = "avm_debug") {
             match event {
@@ -1370,7 +1381,7 @@ impl Player {
         });
 
         // Update mouse state.
-        if let InputEvent::MouseMove { x, y }
+        if let InputEvent::MouseMove { x, y, .. }
         | InputEvent::MouseDown { x, y, .. }
         | InputEvent::MouseUp { x, y, .. } = event
         {
@@ -1390,6 +1401,7 @@ impl Player {
             if self.update_mouse_state(
                 changed_mouse_buttons,
                 is_mouse_moved,
+                mouse_input_source,
                 &mut player_event_handled,
             ) {
                 self.needs_render = true;
@@ -1422,7 +1434,12 @@ impl Player {
         }
 
         if let InputEvent::MouseLeave = event
-            && self.update_mouse_state(changed_mouse_buttons, true, &mut player_event_handled)
+            && self.update_mouse_state(
+                changed_mouse_buttons,
+                true,
+                mouse_input_source,
+                &mut player_event_handled,
+            )
         {
             self.needs_render = true;
         }
@@ -1526,6 +1543,7 @@ impl Player {
         &mut self,
         changed_mouse_buttons: EnumSet<MouseButton>,
         is_mouse_moved: bool,
+        input_source: MouseInputSource,
         player_event_handled: &mut bool,
     ) -> bool {
         let mut new_cursor = self.mouse_cursor;
@@ -1664,9 +1682,12 @@ impl Player {
                     }
 
                     // While dragging, dispatch hover roll/drag events.
-                    // Suppress RollOver/RollOut and DragOver/DragOut events to hovered objects while AVM1 startDrag is active
-                    let suppress_hover_events = context.drag_object.is_some()
-                        && !context.stage.movie().is_action_script_3();
+                    // Touch input and AVM1 startDrag suppress events to hovered objects.
+                    let suppress_hover_events = should_suppress_hover_events(
+                        input_source,
+                        context.drag_object.is_some(),
+                        context.stage.movie().is_action_script_3(),
+                    );
 
                     if !suppress_hover_events {
                         // For AVM1, avoid roll events while dragging; only drag events should be emitted.
@@ -2439,7 +2460,12 @@ impl Player {
         self.mutate_with_update_context(|context| {
             Self::update_drag(context);
         });
-        self.update_mouse_state(EnumSet::empty(), false, &mut false);
+        self.update_mouse_state(
+            EnumSet::empty(),
+            false,
+            self.input.mouse_input_source(),
+            &mut false,
+        );
 
         self.collect_garbage();
 
@@ -3304,4 +3330,43 @@ pub enum PlayerMode {
 
     /// Represents the debug version of Flash Player, i.e. flashplayerdebugger.
     Debug,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_suppress_hover_events;
+    use crate::events::MouseInputSource;
+
+    #[test]
+    fn touch_suppresses_hover_events_while_pressed() {
+        assert!(should_suppress_hover_events(
+            MouseInputSource::Touch,
+            false,
+            true
+        ));
+        assert!(should_suppress_hover_events(
+            MouseInputSource::Touch,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn mouse_preserves_existing_drag_hover_behavior() {
+        assert!(!should_suppress_hover_events(
+            MouseInputSource::Mouse,
+            false,
+            false
+        ));
+        assert!(!should_suppress_hover_events(
+            MouseInputSource::Mouse,
+            true,
+            true
+        ));
+        assert!(should_suppress_hover_events(
+            MouseInputSource::Mouse,
+            true,
+            false
+        ));
+    }
 }

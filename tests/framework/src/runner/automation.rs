@@ -1,6 +1,6 @@
 use ruffle_core::backend::ui::MouseCursor as RuffleMouseCursor;
 use ruffle_core::events::{
-    ImeEvent, KeyDescriptor, KeyLocation, LogicalKey, NamedKey, PhysicalKey,
+    ImeEvent, KeyDescriptor, KeyLocation, LogicalKey, MouseInputSource, NamedKey, PhysicalKey,
     TextControlCode as RuffleTextControlCode,
 };
 use ruffle_core::events::{MouseButton as RuffleMouseButton, MouseWheelDelta};
@@ -30,8 +30,13 @@ pub fn perform_automated_event(evt: &AutomatedEvent, player: &mut Player) {
             // None here means that the core will compute index automatically,
             // however we do not want that in tests.
             index: Some(index.unwrap_or_default()),
+            source: MouseInputSource::Mouse,
         },
-        AutomatedEvent::MouseMove { pos, .. } => PlayerEvent::MouseMove { x: pos.0, y: pos.1 },
+        AutomatedEvent::MouseMove { pos, .. } => PlayerEvent::MouseMove {
+            x: pos.0,
+            y: pos.1,
+            source: MouseInputSource::Mouse,
+        },
         AutomatedEvent::MouseUp { pos, btn } => PlayerEvent::MouseUp {
             x: pos.0,
             y: pos.1,
@@ -40,6 +45,7 @@ pub fn perform_automated_event(evt: &AutomatedEvent, player: &mut Player) {
                 InputMouseButton::Middle => RuffleMouseButton::Middle,
                 InputMouseButton::Right => RuffleMouseButton::Right,
             },
+            source: MouseInputSource::Mouse,
         },
         AutomatedEvent::MouseWheel { lines, pixels } => PlayerEvent::MouseWheel {
             delta: match (lines, pixels) {

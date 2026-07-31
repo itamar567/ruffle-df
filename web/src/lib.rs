@@ -17,7 +17,9 @@ use input::{web_input_to_ruffle_key_descriptor, web_to_ruffle_text_control};
 use js_sys::{Error as JsError, Uint8Array};
 use ruffle_core::context::UpdateContext;
 use ruffle_core::context_menu::ContextMenuCallback;
-use ruffle_core::events::{GamepadButton, MouseButton, MouseWheelDelta, TextControlCode};
+use ruffle_core::events::{
+    GamepadButton, MouseButton, MouseInputSource, MouseWheelDelta, TextControlCode,
+};
 use ruffle_core::tag_utils::SwfMovie;
 use ruffle_core::{FloatDuration, Player, PlayerEvent, StaticCallstack, ViewportDimensions};
 use ruffle_web_common::JsResult;
@@ -45,8 +47,12 @@ use web_sys::{
 
 static RUFFLE_GLOBAL_PANIC: Once = Once::new();
 
-fn is_touch_pointer(pointer_type: &str) -> bool {
-    pointer_type == "touch"
+fn pointer_input_source(pointer_type: &str) -> MouseInputSource {
+    if pointer_type == "touch" {
+        MouseInputSource::Touch
+    } else {
+        MouseInputSource::Mouse
+    }
 }
 
 fn pointer_button(button: i16) -> MouseButton {
@@ -177,6 +183,7 @@ fn release_pointer(
         x: event.offset_x() * instance.device_pixel_ratio,
         y: event.offset_y() * instance.device_pixel_ratio,
         button,
+        source: pointer_input_source(&event.pointer_type()),
     };
     let _ = instance.with_core_mut(|core| {
         core.handle_event(player_event);
@@ -652,6 +659,7 @@ impl RuffleHandle {
                         let event = PlayerEvent::MouseMove {
                             x: js_event.offset_x() * instance.device_pixel_ratio,
                             y: js_event.offset_y() * instance.device_pixel_ratio,
+                            source: pointer_input_source(&js_event.pointer_type()),
                         };
                         let _ = instance.with_core_mut(|core| {
                             core.handle_event(event);
@@ -714,6 +722,7 @@ impl RuffleHandle {
                             button,
                             // TODO The index should be provided by the browser, not calculated.
                             index: None,
+                            source: pointer_input_source(&js_event.pointer_type()),
                         };
                         let handled = instance
                             .with_core_mut(|core| core.handle_event(event))
@@ -739,7 +748,8 @@ impl RuffleHandle {
                             instance,
                             &js_event,
                             pointer_button(js_event.button()),
-                            is_touch_pointer(&js_event.pointer_type()),
+                            pointer_input_source(&js_event.pointer_type())
+                                == MouseInputSource::Touch,
                         );
                     });
                 },
@@ -1453,14 +1463,14 @@ fn global_init() {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_touch_pointer, pointer_button};
-    use ruffle_core::events::MouseButton;
+    use super::{pointer_button, pointer_input_source};
+    use ruffle_core::events::{MouseButton, MouseInputSource};
 
     #[test]
-    fn identifies_touch_pointer_type() {
-        assert!(is_touch_pointer("touch"));
-        assert!(!is_touch_pointer("mouse"));
-        assert!(!is_touch_pointer("pen"));
+    fn maps_pointer_input_source() {
+        assert_eq!(pointer_input_source("touch"), MouseInputSource::Touch);
+        assert_eq!(pointer_input_source("mouse"), MouseInputSource::Mouse);
+        assert_eq!(pointer_input_source("pen"), MouseInputSource::Mouse);
     }
 
     #[test]

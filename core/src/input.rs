@@ -1,6 +1,6 @@
 use crate::events::{
     GamepadButton, ImeEvent, KeyCode, KeyDescriptor, KeyLocation, LogicalKey, MouseButton,
-    MouseWheelDelta, NamedKey, PhysicalKey, PlayerEvent, TextControlCode,
+    MouseInputSource, MouseWheelDelta, NamedKey, PhysicalKey, PlayerEvent, TextControlCode,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use enumset::EnumSet;
@@ -32,17 +32,20 @@ pub enum InputEvent {
     MouseMove {
         x: f64,
         y: f64,
+        source: MouseInputSource,
     },
     MouseUp {
         x: f64,
         y: f64,
         button: MouseButton,
+        source: MouseInputSource,
     },
     MouseDown {
         x: f64,
         y: f64,
         button: MouseButton,
         index: usize,
+        source: MouseInputSource,
     },
     MouseLeave,
     MouseWheel {
@@ -87,6 +90,7 @@ pub struct InputManager {
     last_key: KeyCode,
     last_char: Option<char>,
     last_click: Option<ClickEventData>,
+    mouse_input_source: MouseInputSource,
 
     /// A map from gamepad buttons to key codes.
     gamepad_button_mapping: HashMap<GamepadButton, KeyCode>,
@@ -103,6 +107,7 @@ impl InputManager {
             last_key: KeyCode::UNKNOWN,
             last_char: None,
             last_click: None,
+            mouse_input_source: MouseInputSource::Mouse,
             gamepad_button_mapping,
             key_code_mapping_type: KeyCodeMappingType::Logical,
         }
@@ -206,18 +211,30 @@ impl InputManager {
                 }
             }
 
-            PlayerEvent::MouseMove { x, y } => InputEvent::MouseMove { x, y },
-            PlayerEvent::MouseUp { x, y, button } => InputEvent::MouseUp { x, y, button },
+            PlayerEvent::MouseMove { x, y, source } => InputEvent::MouseMove { x, y, source },
+            PlayerEvent::MouseUp {
+                x,
+                y,
+                button,
+                source,
+            } => InputEvent::MouseUp {
+                x,
+                y,
+                button,
+                source,
+            },
             PlayerEvent::MouseDown {
                 x,
                 y,
                 button,
                 index,
+                source,
             } => InputEvent::MouseDown {
                 x,
                 y,
                 button,
                 index: self.update_last_click(x, y, index),
+                source,
             },
             PlayerEvent::MouseLeave => InputEvent::MouseLeave,
             PlayerEvent::MouseWheel { delta } => InputEvent::MouseWheel { delta },
@@ -271,11 +288,16 @@ impl InputManager {
                 self.last_char = key_char;
                 self.remove_key(key_code);
             }
-            InputEvent::MouseDown { button, .. } => {
+            InputEvent::MouseMove { source, .. } => self.mouse_input_source = source,
+            InputEvent::MouseDown { button, source, .. } => {
+                self.mouse_input_source = source;
                 self.toggle_key(button.into());
                 self.add_key(button.into());
             }
-            InputEvent::MouseUp { button, .. } => self.remove_key(button.into()),
+            InputEvent::MouseUp { button, source, .. } => {
+                self.mouse_input_source = source;
+                self.remove_key(button.into());
+            }
             _ => {}
         }
     }
@@ -325,6 +347,10 @@ impl InputManager {
 
     pub fn is_mouse_down(&self, button: MouseButton) -> bool {
         self.is_key_down(button.into())
+    }
+
+    pub fn mouse_input_source(&self) -> MouseInputSource {
+        self.mouse_input_source
     }
 
     pub fn get_mouse_down_buttons(&self) -> EnumSet<MouseButton> {
@@ -587,6 +613,32 @@ mod tests {
             physical_key: physical,
             key_location: KeyLocation::Standard,
         }
+    }
+
+    #[test]
+    fn input_source_controls_hover_support() {
+        assert!(MouseInputSource::Mouse.supports_hover());
+        assert!(!MouseInputSource::Touch.supports_hover());
+    }
+
+    #[test]
+    fn input_manager_tracks_mouse_input_source() {
+        let mut input = InputManager::new(HashMap::new());
+        assert_eq!(input.mouse_input_source(), MouseInputSource::Mouse);
+
+        input.process_event(PlayerEvent::MouseMove {
+            x: 0.0,
+            y: 0.0,
+            source: MouseInputSource::Touch,
+        });
+        assert_eq!(input.mouse_input_source(), MouseInputSource::Touch);
+
+        input.process_event(PlayerEvent::MouseMove {
+            x: 0.0,
+            y: 0.0,
+            source: MouseInputSource::Mouse,
+        });
+        assert_eq!(input.mouse_input_source(), MouseInputSource::Mouse);
     }
 
     #[test]
