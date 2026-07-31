@@ -1,8 +1,10 @@
 use crate::sandbox::SandboxType;
 
 use gc_arena::Collect;
+use std::cell::UnsafeCell;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use swf::{Fixed8, HeaderExt, Rectangle, Twips};
 use url::Url;
 
@@ -16,8 +18,8 @@ pub struct SwfMovie {
     /// The SWF header parsed from the data stream.
     header: HeaderExt,
 
-    /// Uncompressed SWF data.
-    data: Vec<u8>,
+    /// Uncompressed SWF tag data.
+    data: SwfData,
 
     /// The URL the SWF was downloaded from.
     url: String,
@@ -57,6 +59,91 @@ pub struct SwfMovie {
     sandbox_type: SandboxType,
 }
 
+#[derive(Clone)]
+enum SwfData {
+    Static(Vec<u8>),
+    Streaming(Arc<StreamingSwfData>),
+}
+
+struct StreamingSwfData {
+    bytes: Box<[UnsafeCell<u8>]>,
+    loaded: AtomicUsize,
+    compressed_loaded: AtomicUsize,
+    compressed_len: AtomicUsize,
+    complete: AtomicBool,
+}
+
+unsafe impl Sync for StreamingSwfData {}
+
+impl SwfData {
+    fn available(&self) -> &[u8] {
+        match self {
+            Self::Static(data) => data,
+            Self::Streaming(data) => {
+                let loaded = data.loaded.load(Ordering::Acquire);
+                let pointer = data.bytes.as_ptr().cast::<u8>();
+                // SAFETY: Writers only touch bytes beyond `loaded`, then publish them with
+                // a release store. The allocation never moves and published bytes are immutable.
+                unsafe { std::slice::from_raw_parts(pointer, loaded) }
+            }
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Static(data) => data.len(),
+            Self::Streaming(data) => data.bytes.len(),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        match self {
+            Self::Static(_) => true,
+            Self::Streaming(data) => data.complete.load(Ordering::Acquire),
+        }
+    }
+
+    fn append(&self, bytes: &[u8], compressed_loaded: usize) -> usize {
+        let Self::Streaming(data) = self else {
+            return 0;
+        };
+        let start = data.loaded.load(Ordering::Relaxed);
+        let write_len = bytes.len().min(data.bytes.len().saturating_sub(start));
+        for (destination, source) in data.bytes[start..start + write_len].iter().zip(bytes) {
+            // SAFETY: Progressive loading has one writer, and this range has not
+            // been published to readers yet.
+            unsafe { *destination.get() = *source };
+        }
+        data.compressed_loaded
+            .store(compressed_loaded, Ordering::Release);
+        data.loaded.store(start + write_len, Ordering::Release);
+        write_len
+    }
+
+    fn finish(&self, compressed_len: usize) {
+        if let Self::Streaming(data) = self {
+            data.compressed_loaded
+                .store(compressed_len, Ordering::Release);
+            data.compressed_len.store(compressed_len, Ordering::Release);
+            data.complete.store(true, Ordering::Release);
+        }
+    }
+
+    fn compressed_loaded(&self) -> Option<usize> {
+        match self {
+            Self::Static(_) => None,
+            Self::Streaming(data) => Some(data.compressed_loaded.load(Ordering::Acquire)),
+        }
+    }
+
+    fn compressed_len(&self) -> Option<usize> {
+        match self {
+            Self::Static(_) => None,
+            Self::Streaming(data) => Some(data.compressed_len.load(Ordering::Acquire)),
+        }
+    }
+}
+
 impl SwfMovie {
     /// Construct an empty movie.
     pub fn empty(swf_version: u8, loader_url: Option<String>) -> Self {
@@ -67,7 +154,7 @@ impl SwfMovie {
         let sandbox_type = SandboxType::infer(url.as_str(), &header);
         Self {
             header,
-            data: vec![],
+            data: SwfData::Static(vec![]),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -97,7 +184,7 @@ impl SwfMovie {
         Self {
             header,
             compressed_len,
-            data: Vec::new(),
+            data: SwfData::Static(Vec::new()),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -124,7 +211,7 @@ impl SwfMovie {
         Self {
             header,
             compressed_len: compressed_data.len(),
-            data: compressed_data,
+            data: SwfData::Static(compressed_data),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -148,7 +235,7 @@ impl SwfMovie {
         let sandbox_type = SandboxType::infer(movie_url.as_str(), &header);
         Self {
             header,
-            data: vec![],
+            data: SwfData::Static(vec![]),
             url: movie_url,
             loader_url: None,
             parameters: Vec::new(),
@@ -185,7 +272,7 @@ impl SwfMovie {
 
         let mut movie = Self {
             header: swf_buf.header,
-            data: swf_buf.data,
+            data: SwfData::Static(swf_buf.data),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -198,6 +285,43 @@ impl SwfMovie {
         };
         movie.append_parameters_from_url();
         Ok(movie)
+    }
+
+    /// Construct a progressively populated movie using fixed-address storage.
+    pub fn from_streaming(
+        header: HeaderExt,
+        tag_capacity: usize,
+        url: String,
+        loader_url: Option<String>,
+        compressed_len: Option<usize>,
+    ) -> Self {
+        let encoding = swf::SwfStr::encoding_for_version(header.version());
+        let sandbox_type = SandboxType::infer(url.as_str(), &header);
+        let data = StreamingSwfData {
+            bytes: (0..tag_capacity)
+                .map(|_| UnsafeCell::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            loaded: AtomicUsize::new(0),
+            compressed_loaded: AtomicUsize::new(0),
+            compressed_len: AtomicUsize::new(compressed_len.unwrap_or(0)),
+            complete: AtomicBool::new(false),
+        };
+        let mut movie = Self {
+            header,
+            data: SwfData::Streaming(Arc::new(data)),
+            url,
+            loader_url,
+            parameters: Vec::new(),
+            encoding,
+            compressed_len: compressed_len.unwrap_or(0),
+            is_movie: true,
+            force_avm1: false,
+            is_from_bytes: false,
+            sandbox_type,
+        };
+        movie.append_parameters_from_url();
+        movie
     }
 
     /// Construct a movie based on a loaded image (JPEG, GIF or PNG).
@@ -215,7 +339,7 @@ impl SwfMovie {
         let sandbox_type = SandboxType::infer(url.as_str(), &header);
         let mut movie = Self {
             header,
-            data: vec![],
+            data: SwfData::Static(vec![]),
             url,
             loader_url: None,
             parameters: Vec::new(),
@@ -256,7 +380,31 @@ impl SwfMovie {
     }
 
     pub fn data(&self) -> &[u8] {
-        &self.data
+        self.data.available()
+    }
+
+    pub fn data_capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    pub fn is_data_complete(&self) -> bool {
+        self.data.is_complete()
+    }
+
+    pub fn is_streaming(&self) -> bool {
+        matches!(self.data, SwfData::Streaming(_))
+    }
+
+    pub fn append_data(&self, data: &[u8], compressed_loaded: usize) -> usize {
+        self.data.append(data, compressed_loaded)
+    }
+
+    pub fn finish_data(&self, compressed_len: usize) {
+        self.data.finish(compressed_len);
+    }
+
+    pub fn compressed_loaded_len(&self) -> usize {
+        self.data.compressed_loaded().unwrap_or(self.compressed_len)
     }
 
     /// Returns the suggested string encoding for the given SWF version.
@@ -308,7 +456,7 @@ impl SwfMovie {
     }
 
     pub fn compressed_len(&self) -> usize {
-        self.compressed_len
+        self.data.compressed_len().unwrap_or(self.compressed_len)
     }
 
     pub fn uncompressed_len(&self) -> i32 {
@@ -354,7 +502,7 @@ impl Debug for SwfMovie {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SwfMovie")
             .field("header", &self.header)
-            .field("data", &self.data.len())
+            .field("data", &self.data.available().len())
             .field("url", &self.url)
             .field("loader_url", &self.loader_url)
             .field("parameters", &self.parameters)
@@ -373,16 +521,19 @@ pub struct SwfSlice {
     pub movie: Arc<SwfMovie>,
     pub start: usize,
     pub end: usize,
+    dynamic_end: bool,
 }
 
 impl From<Arc<SwfMovie>> for SwfSlice {
     fn from(movie: Arc<SwfMovie>) -> Self {
-        let end = movie.data().len();
+        let dynamic_end = !movie.is_data_complete();
+        let end = movie.data_capacity();
 
         Self {
             movie,
             start: 0,
             end,
+            dynamic_end,
         }
     }
 }
@@ -402,6 +553,7 @@ impl SwfSlice {
             movie,
             start: 0,
             end: 0,
+            dynamic_end: false,
         }
     }
 
@@ -424,6 +576,7 @@ impl SwfSlice {
                 movie: self.movie.clone(),
                 start: slice_pval - self_pval,
                 end: (slice_pval - self_pval) + slice.len(),
+                dynamic_end: false,
             }
         } else {
             self.copy_empty()
@@ -444,6 +597,7 @@ impl SwfSlice {
                 movie: self.movie.clone(),
                 start: slice_pval - self_pval,
                 end: (slice_pval - self_pval) + slice.len(),
+                dynamic_end: false,
             }
         } else {
             self.copy_empty()
@@ -464,7 +618,12 @@ impl SwfSlice {
 
     /// Convert the SwfSlice into a standard data slice.
     pub fn data(&self) -> &[u8] {
-        &self.movie.data()[self.start..self.end]
+        let available_end = if self.dynamic_end {
+            self.end.min(self.movie.data().len())
+        } else {
+            self.end
+        };
+        &self.movie.data()[self.start.min(available_end)..available_end]
     }
 
     /// Get the version of the SWF this data comes from.
@@ -487,6 +646,38 @@ impl SwfSlice {
     /// Get the length of the SwfSlice.
     pub fn len(&self) -> usize {
         self.end - self.start
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_slice_grows_without_moving_published_bytes() {
+        let movie = Arc::new(SwfMovie::from_streaming(
+            HeaderExt::default_with_swf_version(10),
+            4,
+            "https://example.com/movie.swf".to_string(),
+            None,
+            Some(8),
+        ));
+        let slice = SwfSlice::from(movie.clone());
+
+        assert!(slice.data().is_empty());
+        assert_eq!(movie.append_data(&[1, 2], 5), 2);
+        let first_pointer = slice.data().as_ptr();
+        assert_eq!(slice.data(), [1, 2]);
+
+        assert_eq!(movie.append_data(&[3, 4, 5], 8), 2);
+        assert_eq!(slice.data(), [1, 2, 3, 4]);
+        assert_eq!(slice.data().as_ptr(), first_pointer);
+        assert!(!movie.is_data_complete());
+
+        movie.finish_data(9);
+        assert!(movie.is_data_complete());
+        assert_eq!(movie.compressed_len(), 9);
+        assert_eq!(movie.compressed_loaded_len(), 9);
     }
 }
 

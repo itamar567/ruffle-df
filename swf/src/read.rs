@@ -129,57 +129,114 @@ pub fn decompress_swf<'a, R: Read + 'a>(mut input: R) -> Result<SwfBuf> {
         log::warn!("SWF length doesn't match header, may be corrupt");
     }
 
-    let mut reader = Reader::new(&data, version);
-    let stage_size = reader.read_rectangle()?;
-    let frame_rate = reader.read_fixed8()?;
-    let num_frames = reader.read_u16()?;
-    let header = Header {
-        compression,
-        version,
-        stage_size,
-        frame_rate,
-        num_frames,
-    };
-    let offset = reader.as_slice().as_ptr() as usize - data.as_ptr() as usize;
+    let (header, offset) =
+        read_header_from_uncompressed(compression, version, uncompressed_len, &data, true)?;
     // Remove the header.
     // As an alternative we could return the entire original buffer with header length,
     // but that's a nontrivial API change, probably not worth the effort.
     data.drain(..offset);
-    let mut reader = Reader::new(&data, version);
 
-    // Parse the first two tags, searching for the FileAttributes and SetBackgroundColor tags.
-    // This metadata is useful, so we want to return it along with the header.
-    // In SWF8+, FileAttributes should be the first tag in the SWF.
-    // FileAttributes anywhere else in the SWF are ignored.
-    let mut tag = reader.read_tag();
-    let file_attributes = if let Ok(Tag::FileAttributes(attributes)) = tag {
-        tag = reader.read_tag();
-        attributes
-    } else {
-        FileAttributes::default()
-    };
+    Ok(SwfBuf { header, data })
+}
 
-    // In most SWFs, SetBackgroundColor will be the second or third tag after FileAttributes + Metadata.
-    // It's possible for the SetBackgroundColor tag to be missing or appear later in wacky SWFs, so let's
-    // return `None` in this case.
+/// Parse the uncompressed movie header at the beginning of an SWF body.
+///
+/// The returned offset is the start of the tag stream. When `require_complete`
+/// is false, metadata tags that have not arrived in full yet are ignored. The
+/// basic header and a leading `FileAttributes` tag are always required in full.
+pub fn read_header_from_uncompressed(
+    compression: Compression,
+    version: u8,
+    uncompressed_len: u32,
+    data: &[u8],
+    require_complete: bool,
+) -> Result<(HeaderExt, usize)> {
+    let mut reader = Reader::new(data, version);
+    let stage_size = reader.read_rectangle()?;
+    let frame_rate = reader.read_fixed8()?;
+    let num_frames = reader.read_u16()?;
+    let tag_offset = reader.as_slice().as_ptr() as usize - data.as_ptr() as usize;
+    let tags = reader.get_ref();
+
+    let mut file_attributes = FileAttributes::default();
     let mut background_color = None;
-    for _ in 0..2 {
-        if let Ok(Tag::SetBackgroundColor(color)) = tag {
-            background_color = Some(color);
+    let mut tag_reader = Reader::new(tags, version);
+
+    for index in 0..3 {
+        let tag_data = tag_reader.get_ref();
+        if tag_data.is_empty() {
+            break;
+        }
+
+        let Some(total_len) = complete_tag_len(tag_data)? else {
+            let tag_code = Reader::new(tag_data, version).read_tag_code()?;
+            if require_complete
+                || (index == 0 && TagCode::from_u16(tag_code) == Some(TagCode::FileAttributes))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Incomplete SWF metadata tag",
+                )
+                .into());
+            }
             break;
         };
-        tag = reader.read_tag();
+
+        let mut complete_reader = Reader::new(&tag_data[..total_len], version);
+        let (tag_code, body_len) = complete_reader.read_tag_code_and_length()?;
+        let mut body_reader = Reader::new(complete_reader.read_slice(body_len)?, version);
+        match TagCode::from_u16(tag_code) {
+            Some(TagCode::FileAttributes) if index == 0 => {
+                file_attributes = body_reader.read_file_attributes()?;
+            }
+            Some(TagCode::SetBackgroundColor) => {
+                background_color = Some(body_reader.read_rgb()?);
+            }
+            _ => {}
+        }
+        *tag_reader.get_mut() = &tag_data[total_len..];
     }
 
-    Ok(SwfBuf {
-        header: HeaderExt {
-            header,
+    Ok((
+        HeaderExt {
+            header: Header {
+                compression,
+                version,
+                stage_size,
+                frame_rate,
+                num_frames,
+            },
             file_attributes,
             background_color,
             uncompressed_len: uncompressed_len as i32,
         },
-        data,
-    })
+        tag_offset,
+    ))
+}
+
+/// Return the total size of the first tag when it is fully available.
+pub fn complete_tag_len(data: &[u8]) -> Result<Option<usize>> {
+    if data.len() < 2 {
+        return Ok(None);
+    }
+
+    let short_header = u16::from_le_bytes([data[0], data[1]]);
+    let short_len = (short_header & 0x3f) as usize;
+    let (header_len, body_len) = if short_len == 0x3f {
+        if data.len() < 6 {
+            return Ok(None);
+        }
+        (
+            6usize,
+            u32::from_le_bytes([data[2], data[3], data[4], data[5]]) as usize,
+        )
+    } else {
+        (2usize, short_len)
+    };
+    let total_len = header_len
+        .checked_add(body_len)
+        .ok_or_else(|| Error::invalid_data("Malformed SWF tag length"))?;
+    Ok((total_len <= data.len()).then_some(total_len))
 }
 
 #[cfg(feature = "flate2")]

@@ -509,7 +509,18 @@ impl<'gc> MovieClip<'gc> {
             return false;
         }
 
-        if progress.next_preload_chunk.get() >= swf.len() as u64 {
+        let available_len = swf.data().len() as u64;
+        if progress.next_preload_chunk.get() >= available_len {
+            if !swf.movie.is_data_complete() {
+                return false;
+            }
+            if progress.next_preload_chunk.get() != u64::MAX {
+                if progress.cur_preload_frame.get() == 1 {
+                    let mut reader = swf.read_from(available_len);
+                    shared.show_frame(&mut reader).unwrap();
+                }
+                progress.next_preload_chunk.set(u64::MAX);
+            }
             return true;
         }
 
@@ -612,6 +623,7 @@ impl<'gc> MovieClip<'gc> {
             Ok(true)
         };
         let is_finished = !progress.awaiting_import.get()
+            && swf.movie.is_data_complete()
             && (progress.has_end_tag.get()
                 || result.is_err()
                 || !result.unwrap_or_default()
@@ -1211,6 +1223,9 @@ impl<'gc> MovieClip<'gc> {
     /// run through `progress`, we instead emulate this property by scaling the
     /// loaded bytes by the compression ratio of the SWF.
     pub fn compressed_loaded_bytes(self) -> u32 {
+        if self.is_root() && self.movie().is_streaming() {
+            return self.movie().compressed_loaded_len().min(u32::MAX as usize) as u32;
+        }
         (self.loaded_bytes() as f64 * self.compressed_total_bytes() as f64
             / self.total_bytes() as f64) as u32
     }

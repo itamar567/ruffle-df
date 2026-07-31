@@ -39,6 +39,7 @@ use crate::tag_utils::SwfMovie;
 use crate::vminterface::Instantiator;
 use chardetng::EncodingDetector;
 use encoding_rs::{UTF_8, WINDOWS_1252};
+use flate2::{Decompress, FlushDecompress, Status};
 use gc_arena::Collect;
 use indexmap::IndexMap;
 use ruffle_common::tag_utils::LoadBytesInfo;
@@ -49,7 +50,8 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use swf::read::{extract_swz, read_compression_type};
+use swf::read::{complete_tag_len, extract_swz, read_compression_type};
+use swf::{Compression, HeaderExt};
 use thiserror::Error;
 use url::{ParseError, Url, form_urlencoded};
 
@@ -320,6 +322,7 @@ impl<'gc> LoadManager<'gc> {
             vm_data,
             loader_status: LoaderStatus::Pending,
             movie: None,
+            last_preload_progress: None,
         };
         let handle = self.add_loader(loader);
         let loader = self.get_loader_mut(handle).unwrap();
@@ -408,6 +411,7 @@ impl<'gc> LoadManager<'gc> {
             vm_data,
             loader_status: LoaderStatus::Pending,
             movie: None,
+            last_preload_progress: None,
         };
         let handle = context.load_manager.add_loader(loader);
         MovieLoader::movie_loader_bytes(handle, context, loader_url, bytes)
@@ -493,6 +497,205 @@ impl<'gc> LoadManager<'gc> {
 impl Default for LoadManager<'_> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+const SWF_FILE_HEADER_LEN: usize = 8;
+const MAX_SWF_DATA_CAPACITY: usize = 128 * 1024 * 1024;
+
+struct ProgressiveSwfUpdate {
+    header: Option<(HeaderExt, usize)>,
+    tags: Vec<u8>,
+}
+
+enum ProgressiveCompression {
+    Pending,
+    None,
+    Zlib(Decompress),
+    Lzma(Vec<u8>),
+}
+
+struct ProgressiveSwfDecoder {
+    compression: ProgressiveCompression,
+    file_header: Vec<u8>,
+    body_header: Vec<u8>,
+    pending_tags: Vec<u8>,
+    header: Option<HeaderExt>,
+    header_emitted: bool,
+    body_capacity: usize,
+    tag_capacity: usize,
+    compressed_received: usize,
+}
+
+impl ProgressiveSwfDecoder {
+    fn new() -> Self {
+        Self {
+            compression: ProgressiveCompression::Pending,
+            file_header: Vec::with_capacity(SWF_FILE_HEADER_LEN),
+            body_header: Vec::new(),
+            pending_tags: Vec::new(),
+            header: None,
+            header_emitted: false,
+            body_capacity: 0,
+            tag_capacity: 0,
+            compressed_received: 0,
+        }
+    }
+
+    fn push(&mut self, mut input: &[u8]) -> Result<ProgressiveSwfUpdate, Error> {
+        self.compressed_received += input.len();
+        if matches!(self.compression, ProgressiveCompression::Pending) {
+            let header_len = (SWF_FILE_HEADER_LEN - self.file_header.len()).min(input.len());
+            self.file_header.extend_from_slice(&input[..header_len]);
+            input = &input[header_len..];
+            if self.file_header.len() < SWF_FILE_HEADER_LEN {
+                return Ok(self.take_update());
+            }
+            self.initialize_compression()?;
+        }
+
+        self.decompress(input, FlushDecompress::None)?;
+        self.try_read_header(false)?;
+        Ok(self.take_update())
+    }
+
+    fn finish(&mut self) -> Result<ProgressiveSwfUpdate, Error> {
+        match &mut self.compression {
+            ProgressiveCompression::Zlib(_) => {
+                self.decompress(&[], FlushDecompress::Finish)?;
+                self.try_read_header(true)?;
+            }
+            ProgressiveCompression::Lzma(data) => {
+                let swf = swf::decompress_swf(data.as_slice())?;
+                self.tag_capacity = swf.data.len();
+                self.header = Some(swf.header);
+                self.pending_tags.extend_from_slice(&swf.data);
+            }
+            ProgressiveCompression::None => self.try_read_header(true)?,
+            ProgressiveCompression::Pending => {
+                return Err(swf::error::Error::invalid_data("Incomplete SWF header").into());
+            }
+        }
+        Ok(self.take_update())
+    }
+
+    fn initialize_compression(&mut self) -> Result<(), Error> {
+        let compression = read_compression_type(&self.file_header[..3])?;
+        let version = self.file_header[3];
+        if version == 0 {
+            return Err(swf::error::Error::invalid_data("Invalid SWF version").into());
+        }
+        let uncompressed_len = u32::from_le_bytes(
+            self.file_header[4..8]
+                .try_into()
+                .expect("fixed-length SWF header"),
+        );
+        self.body_capacity = uncompressed_len
+            .checked_sub(SWF_FILE_HEADER_LEN as u32)
+            .ok_or_else(|| swf::error::Error::invalid_data("Malformed SWF length"))?
+            .min(MAX_SWF_DATA_CAPACITY as u32) as usize;
+        self.body_header.reserve(self.body_capacity.min(4096));
+        self.compression = match compression {
+            Compression::None => ProgressiveCompression::None,
+            Compression::Zlib => ProgressiveCompression::Zlib(Decompress::new(true)),
+            Compression::Lzma => ProgressiveCompression::Lzma(self.file_header.clone()),
+        };
+        Ok(())
+    }
+
+    fn decompress(&mut self, input: &[u8], flush: FlushDecompress) -> Result<(), Error> {
+        let mut decompressed = Vec::new();
+        match &mut self.compression {
+            ProgressiveCompression::None => decompressed.extend_from_slice(input),
+            ProgressiveCompression::Lzma(data) => data.extend_from_slice(input),
+            ProgressiveCompression::Zlib(decompressor) => {
+                let mut consumed = 0;
+                let mut output = [0; 32 * 1024];
+                loop {
+                    let before_in = decompressor.total_in();
+                    let before_out = decompressor.total_out();
+                    let status = decompressor
+                        .decompress(&input[consumed..], &mut output, flush)
+                        .map_err(|error| swf::error::Error::invalid_data(error.to_string()))?;
+                    consumed += (decompressor.total_in() - before_in) as usize;
+                    let produced = (decompressor.total_out() - before_out) as usize;
+                    decompressed.extend_from_slice(&output[..produced]);
+                    if status == Status::StreamEnd
+                        || (consumed == input.len() && produced < output.len())
+                        || (consumed == input.len() && produced == 0)
+                    {
+                        break;
+                    }
+                }
+            }
+            ProgressiveCompression::Pending => {}
+        }
+        self.append_body(&decompressed);
+        Ok(())
+    }
+
+    fn append_body(&mut self, input: &[u8]) {
+        let current_len = self.body_header.len() + self.pending_tags.len();
+        let len = input
+            .len()
+            .min(self.body_capacity.saturating_sub(current_len));
+        if self.header.is_some() {
+            self.pending_tags.extend_from_slice(&input[..len]);
+        } else {
+            self.body_header.extend_from_slice(&input[..len]);
+        }
+    }
+
+    fn try_read_header(&mut self, require_complete: bool) -> Result<(), Error> {
+        if self.header.is_some() {
+            return Ok(());
+        }
+        let compression = match self.compression {
+            ProgressiveCompression::None => Compression::None,
+            ProgressiveCompression::Zlib(_) => Compression::Zlib,
+            ProgressiveCompression::Lzma(_) | ProgressiveCompression::Pending => return Ok(()),
+        };
+        let version = self.file_header[3];
+        let uncompressed_len = u32::from_le_bytes(
+            self.file_header[4..8]
+                .try_into()
+                .expect("fixed-length SWF header"),
+        );
+        match swf::read_header_from_uncompressed(
+            compression,
+            version,
+            uncompressed_len,
+            &self.body_header,
+            require_complete,
+        ) {
+            Ok((header, tag_offset)) => {
+                self.tag_capacity = self.body_capacity.saturating_sub(tag_offset);
+                self.pending_tags
+                    .extend_from_slice(&self.body_header[tag_offset..]);
+                self.body_header.clear();
+                self.header = Some(header);
+                Ok(())
+            }
+            Err(_) if !require_complete => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn take_update(&mut self) -> ProgressiveSwfUpdate {
+        let mut complete_len = 0;
+        while let Ok(Some(tag_len)) = complete_tag_len(&self.pending_tags[complete_len..]) {
+            complete_len += tag_len;
+        }
+        let tags = self.pending_tags.drain(..complete_len).collect();
+        let header = if self.header_emitted {
+            None
+        } else {
+            self.header_emitted = self.header.is_some();
+            self.header
+                .as_ref()
+                .map(|header| (header.clone(), self.tag_capacity))
+        };
+        ProgressiveSwfUpdate { header, tags }
     }
 }
 
@@ -593,6 +796,9 @@ pub struct MovieLoader<'gc> {
     /// completed and we expect the Player to periodically tick preload
     /// until loading completes.
     movie: Option<Arc<SwfMovie>>,
+
+    #[collect(require_static)]
+    last_preload_progress: Option<(usize, usize)>,
 }
 
 impl<'gc> MovieLoader<'gc> {
@@ -654,12 +860,22 @@ impl<'gc> MovieLoader<'gc> {
 
         let did_finish = mc.preload(context, limit);
 
-        MovieLoader::movie_loader_progress(
-            handle,
-            context,
+        let progress = (
             mc.compressed_loaded_bytes() as usize,
             mc.compressed_total_bytes() as usize,
-        )?;
+        );
+        let should_report_progress = context
+            .load_manager
+            .get_loader(handle)
+            .is_some_and(|loader| loader.last_preload_progress != Some(progress));
+        if should_report_progress {
+            context
+                .load_manager
+                .get_loader_mut(handle)
+                .unwrap()
+                .last_preload_progress = Some(progress);
+            MovieLoader::movie_loader_progress(handle, context, progress.0, progress.1)?;
+        }
 
         if did_finish {
             MovieLoader::movie_loader_complete(
@@ -743,24 +959,283 @@ impl<'gc> MovieLoader<'gc> {
                 MovieLoader::movie_loader_start(handle, uc)
             })?;
 
-            let response = wait_for_full_response(fetch).await;
-            let player = player.lock().unwrap();
-            match response {
-                Ok((body, url, status, redirected)) if replacing_root_movie => {
-                    Self::on_success_root_movie(
-                        player, handle, loader_url, body, url, status, redirected,
-                    )?;
-                }
-                Ok((body, url, status, redirected)) => {
-                    Self::on_success(player, handle, loader_url, body, url, status, redirected)?;
-                }
+            let mut response = match fetch.await {
+                Ok(response) => response,
                 Err(response) => {
-                    Self::on_error(player, handle, response)?;
+                    Self::on_error(player.lock().unwrap(), handle, response)?;
+                    return Ok(());
+                }
+            };
+            let url = response.url().into_owned();
+            let status = response.status();
+            let redirected = response.redirected();
+            let expected_len = response
+                .expected_length()?
+                .and_then(|length| usize::try_from(length).ok());
+            let mut initial_data = Vec::new();
+            let mut is_swf = false;
+
+            while let Some(chunk) = response.next_chunk().await? {
+                initial_data.extend_from_slice(&chunk);
+                if initial_data.len() >= 3 {
+                    is_swf = ContentType::sniff(&initial_data) == ContentType::Swf;
+                    break;
+                }
+            }
+
+            if is_swf && !replacing_root_movie {
+                Self::load_progressive_swf(
+                    player,
+                    handle,
+                    loader_url,
+                    response,
+                    initial_data,
+                    url,
+                    status,
+                    redirected,
+                    expected_len,
+                )
+                .await?;
+            } else {
+                while let Some(chunk) = response.next_chunk().await? {
+                    initial_data.extend_from_slice(&chunk);
+                }
+                let player = player.lock().unwrap();
+                if replacing_root_movie {
+                    Self::on_success_root_movie(
+                        player,
+                        handle,
+                        loader_url,
+                        initial_data,
+                        url,
+                        status,
+                        redirected,
+                    )?;
+                } else {
+                    Self::on_success(
+                        player,
+                        handle,
+                        loader_url,
+                        initial_data,
+                        url,
+                        status,
+                        redirected,
+                    )?;
                 }
             }
 
             Ok(())
         })
+    }
+
+    async fn load_progressive_swf(
+        player: Arc<Mutex<Player>>,
+        handle: LoaderHandle,
+        loader_url: Option<String>,
+        mut response: Box<dyn SuccessResponse>,
+        initial_data: Vec<u8>,
+        url: String,
+        status: u16,
+        redirected: bool,
+        expected_len: Option<usize>,
+    ) -> Result<(), Error> {
+        let mut decoder = ProgressiveSwfDecoder::new();
+        let mut movie = None;
+        let update = decoder.push(&initial_data)?;
+        Self::apply_progressive_movie_update(
+            &player,
+            handle,
+            &mut movie,
+            &url,
+            loader_url.as_deref(),
+            status,
+            redirected,
+            expected_len,
+            decoder.compressed_received,
+            update,
+        )?;
+
+        while let Some(chunk) = response.next_chunk().await? {
+            let update = decoder.push(&chunk)?;
+            Self::apply_progressive_movie_update(
+                &player,
+                handle,
+                &mut movie,
+                &url,
+                loader_url.as_deref(),
+                status,
+                redirected,
+                expected_len,
+                decoder.compressed_received,
+                update,
+            )?;
+        }
+
+        let update = decoder.finish()?;
+        Self::apply_progressive_movie_update(
+            &player,
+            handle,
+            &mut movie,
+            &url,
+            loader_url.as_deref(),
+            status,
+            redirected,
+            expected_len,
+            decoder.compressed_received,
+            update,
+        )?;
+        let movie = movie.ok_or_else(|| swf::error::Error::invalid_data("Missing SWF header"))?;
+        movie.finish_data(decoder.compressed_received);
+        player.lock().unwrap().mutate_with_update_context(|uc| {
+            MovieLoader::preload_tick(
+                handle,
+                uc,
+                &mut ExecutionLimit::with_max_ops_and_time(10000, Duration::from_millis(1)),
+                status,
+                redirected,
+            )
+        })?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_progressive_movie_update(
+        player: &Arc<Mutex<Player>>,
+        handle: LoaderHandle,
+        movie: &mut Option<Arc<SwfMovie>>,
+        url: &str,
+        loader_url: Option<&str>,
+        status: u16,
+        redirected: bool,
+        expected_len: Option<usize>,
+        compressed_received: usize,
+        update: ProgressiveSwfUpdate,
+    ) -> Result<(), Error> {
+        if let Some((header, tag_capacity)) = update.header {
+            let mut swf = SwfMovie::from_streaming(
+                header,
+                tag_capacity,
+                url.to_string(),
+                loader_url.map(str::to_string),
+                expected_len,
+            );
+            let force_avm1 = player.lock().unwrap().mutate_with_update_context(|uc| {
+                matches!(
+                    uc.load_manager
+                        .get_loader(handle)
+                        .map(|loader| loader.vm_data),
+                    Some(MovieLoaderVMData::Avm1 { .. })
+                )
+            });
+            if force_avm1 {
+                swf.set_force_avm1();
+            }
+            swf.append_data(&update.tags, compressed_received);
+            let swf = Arc::new(swf);
+            player.lock().unwrap().mutate_with_update_context(|uc| {
+                MovieLoader::initialize_progressive_movie(handle, uc, swf.clone())
+            })?;
+            *movie = Some(swf);
+        } else if let Some(movie) = movie.as_ref() {
+            movie.append_data(&update.tags, compressed_received);
+        }
+
+        if !update.tags.is_empty() {
+            player.lock().unwrap().mutate_with_update_context(|uc| {
+                MovieLoader::preload_tick(
+                    handle,
+                    uc,
+                    &mut ExecutionLimit::with_max_ops_and_time(10000, Duration::from_millis(1)),
+                    status,
+                    redirected,
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn initialize_progressive_movie(
+        handle: LoaderHandle,
+        uc: &mut UpdateContext<'gc>,
+        movie: Arc<SwfMovie>,
+    ) -> Result<(), Error> {
+        let (clip, vm_data) = match uc.load_manager.get_loader(handle) {
+            Some(loader) => (loader.target_clip, loader.vm_data),
+            None => return Err(Error::Cancelled),
+        };
+        if uc.load_manager.load_cancelled_avm1(handle) {
+            return Err(Error::Cancelled);
+        }
+
+        let domain = if let MovieLoaderVMData::Avm2 {
+            context,
+            default_domain,
+            ..
+        } = vm_data
+        {
+            use crate::avm2::globals::slots::flash_system_loader_context as loader_context_slots;
+            context
+                .map(|object| object.get_slot(loader_context_slots::APPLICATION_DOMAIN))
+                .and_then(|value| value.as_object())
+                .and_then(|object| object.as_application_domain())
+                .unwrap_or_else(|| Avm2Domain::movie_domain(uc, default_domain))
+        } else {
+            uc.avm2.stage_domain()
+        };
+
+        let loader = uc
+            .load_manager
+            .get_loader_mut(handle)
+            .ok_or(Error::Cancelled)?;
+        loader.loader_status = LoaderStatus::Parsing;
+        loader.movie = Some(movie.clone());
+
+        if let MovieLoaderVMData::Avm2 { loader_info, .. } = vm_data {
+            loader_info.set_content_type(ContentType::Swf);
+            let fake_movie = Arc::new(SwfMovie::fake_with_compressed_len(
+                uc.root_swf.version(),
+                movie.loader_url().map(str::to_string),
+                movie.compressed_len(),
+            ));
+            loader_info.set_loader_stream(
+                LoaderStream::NotYetLoaded(fake_movie, Some(clip), false),
+                uc.gc(),
+            );
+            Self::movie_loader_progress(handle, uc, 0, movie.compressed_len())?;
+            loader_info.set_loader_stream(
+                LoaderStream::NotYetLoaded(movie.clone(), Some(clip), false),
+                uc.gc(),
+            );
+        }
+
+        uc.library
+            .library_for_movie_mut(movie.clone())
+            .set_avm2_domain(domain);
+        if let Some(mc) = clip.as_movie_clip() {
+            let loader_info = match vm_data {
+                MovieLoaderVMData::Avm2 { loader_info, .. } => Some(loader_info),
+                MovieLoaderVMData::Avm1 { .. } => None,
+            };
+            mc.replace_with_movie(uc, Some(movie.clone()), true, loader_info);
+            if !movie.is_action_script_3()
+                && let Some(object) = mc.object1()
+            {
+                let prototype = uc.avm1.prototypes(mc.swf_version()).movie_clip;
+                object.define_value(
+                    uc.gc(),
+                    istr!(uc, "__proto__"),
+                    prototype.into(),
+                    Attribute::DONT_ENUM | Attribute::DONT_DELETE,
+                );
+            }
+            mc.set_instantiated_by_timeline(true);
+            if matches!(vm_data, MovieLoaderVMData::Avm2 { .. }) && !movie.is_action_script_3() {
+                mc.post_instantiation(uc, None, Instantiator::Movie, false);
+                mc.set_depth(LOADER_INSERTED_AVM1_DEPTH);
+                mc.set_avm1movie(uc);
+            }
+        }
+        Ok(())
     }
 
     fn on_success_root_movie(
@@ -915,6 +1390,43 @@ impl<'gc> MovieLoader<'gc> {
     }
 }
 
+fn apply_root_swf_update(
+    player: &Arc<Mutex<Player>>,
+    movie: &mut Option<Arc<SwfMovie>>,
+    on_metadata: &mut Option<Box<dyn FnOnce(&HeaderExt)>>,
+    parameters: &[(String, String)],
+    url: &str,
+    expected_len: Option<usize>,
+    compressed_received: usize,
+    update: ProgressiveSwfUpdate,
+) {
+    if let Some((header, tag_capacity)) = update.header {
+        if let Some(callback) = on_metadata.take() {
+            callback(&header);
+        }
+        let mut new_movie =
+            SwfMovie::from_streaming(header, tag_capacity, url.to_string(), None, expected_len);
+        new_movie.append_parameters(parameters.iter().cloned());
+        new_movie.append_data(&update.tags, compressed_received);
+        *movie = Some(player.lock().unwrap().mutate_with_update_context(|uc| {
+            uc.set_root_movie(new_movie);
+            uc.root_swf.clone()
+        }));
+    } else if let Some(movie) = movie {
+        movie.append_data(&update.tags, compressed_received);
+    }
+
+    if !update.tags.is_empty() {
+        player
+            .lock()
+            .unwrap()
+            .preload(&mut ExecutionLimit::with_max_ops_and_time(
+                10000,
+                Duration::from_millis(1),
+            ));
+    }
+}
+
 /// Kick off the root movie load.
 ///
 /// The root movie is special because it determines a few bits of player
@@ -932,7 +1444,7 @@ pub fn load_root_movie<'gc>(
 
     Box::pin(async move {
         let fetch = player.lock().unwrap().fetch(request, FetchReason::LoadSwf);
-        let response = fetch.await.map_err(|error| {
+        let mut response = fetch.await.map_err(|error| {
             player
                 .lock()
                 .unwrap()
@@ -941,15 +1453,10 @@ pub fn load_root_movie<'gc>(
             error.error
         })?;
         let swf_url = response.url().into_owned();
-        let body = response.body().await.inspect_err(|error| {
-            player
-                .lock()
-                .unwrap()
-                .ui()
-                .display_root_movie_download_failed_message(true, error.to_string());
-        })?;
+        let expected_len = response
+            .expected_length()?
+            .and_then(|length| usize::try_from(length).ok());
 
-        // The spoofed root movie URL takes precedence over the actual URL.
         let spoofed_or_swf_url = player
             .lock()
             .unwrap()
@@ -957,19 +1464,62 @@ pub fn load_root_movie<'gc>(
             .map(|u| u.to_string())
             .unwrap_or(swf_url);
 
-        let mut movie =
-            SwfMovie::from_data(&body, spoofed_or_swf_url, None, None).inspect_err(|error| {
+        let mut decoder = ProgressiveSwfDecoder::new();
+        let mut movie = None;
+        let mut on_metadata = Some(on_metadata);
+
+        while let Some(chunk) = response.next_chunk().await.inspect_err(|error| {
+            player
+                .lock()
+                .unwrap()
+                .ui()
+                .display_root_movie_download_failed_message(true, error.to_string());
+        })? {
+            let update = decoder.push(&chunk).inspect_err(|error| {
                 player
                     .lock()
                     .unwrap()
                     .ui()
                     .display_root_movie_download_failed_message(true, error.to_string());
             })?;
-        on_metadata(movie.header());
-        movie.append_parameters(parameters);
-        player.lock().unwrap().mutate_with_update_context(|uc| {
-            uc.set_root_movie(movie);
-        });
+            apply_root_swf_update(
+                &player,
+                &mut movie,
+                &mut on_metadata,
+                &parameters,
+                &spoofed_or_swf_url,
+                expected_len,
+                decoder.compressed_received,
+                update,
+            );
+        }
+
+        let update = decoder.finish().inspect_err(|error| {
+            player
+                .lock()
+                .unwrap()
+                .ui()
+                .display_root_movie_download_failed_message(true, error.to_string());
+        })?;
+        apply_root_swf_update(
+            &player,
+            &mut movie,
+            &mut on_metadata,
+            &parameters,
+            &spoofed_or_swf_url,
+            expected_len,
+            decoder.compressed_received,
+            update,
+        );
+        let movie = movie.ok_or_else(|| swf::error::Error::invalid_data("Missing SWF header"))?;
+        movie.finish_data(decoder.compressed_received);
+        player
+            .lock()
+            .unwrap()
+            .preload(&mut ExecutionLimit::with_max_ops_and_time(
+                10000,
+                Duration::from_millis(1),
+            ));
         Ok(())
     })
 }
@@ -2887,4 +3437,74 @@ pub fn upload_file<'gc>(
             Ok(())
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::Compression as FlateCompression;
+    use flate2::write::ZlibEncoder;
+    use std::io::Write;
+
+    fn swf_body() -> Vec<u8> {
+        vec![0x08, 0x00, 0x00, 0x0c, 0x01, 0x00, 0x40, 0x00, 0x00, 0x00]
+    }
+
+    fn swf_file(signature: &[u8; 3], payload: &[u8], body_len: usize) -> Vec<u8> {
+        let mut file = Vec::from(signature.as_slice());
+        file.push(10);
+        file.extend_from_slice(&((body_len + SWF_FILE_HEADER_LEN) as u32).to_le_bytes());
+        file.extend_from_slice(payload);
+        file
+    }
+
+    fn decode_in_chunks(file: &[u8]) -> (HeaderExt, Vec<u8>, bool) {
+        let mut decoder = ProgressiveSwfDecoder::new();
+        let mut header = None;
+        let mut tags = Vec::new();
+
+        for byte in file {
+            let update = decoder.push(std::slice::from_ref(byte)).unwrap();
+            header = header.or_else(|| update.header.map(|value| value.0));
+            tags.extend(update.tags);
+            if tags.len() == 2 {
+                break;
+            }
+        }
+        let first_tag_was_progressive = tags == [0x40, 0x00];
+
+        let consumed = decoder.compressed_received;
+        let update = decoder.push(&file[consumed..]).unwrap();
+        header = header.or_else(|| update.header.map(|value| value.0));
+        tags.extend(update.tags);
+        let update = decoder.finish().unwrap();
+        header = header.or_else(|| update.header.map(|value| value.0));
+        tags.extend(update.tags);
+        (header.unwrap(), tags, first_tag_was_progressive)
+    }
+
+    #[test]
+    fn progressively_decodes_fws_tags() {
+        let body = swf_body();
+        let file = swf_file(b"FWS", &body, body.len());
+        let (header, tags, first_tag_was_progressive) = decode_in_chunks(&file);
+
+        assert_eq!(header.version(), 10);
+        assert_eq!(header.num_frames(), 1);
+        assert_eq!(tags, body[6..]);
+        assert!(first_tag_was_progressive);
+    }
+
+    #[test]
+    fn progressively_decompresses_cws_tags() {
+        let body = swf_body();
+        let mut encoder = ZlibEncoder::new(Vec::new(), FlateCompression::default());
+        encoder.write_all(&body).unwrap();
+        let file = swf_file(b"CWS", &encoder.finish().unwrap(), body.len());
+        let (header, tags, first_tag_was_progressive) = decode_in_chunks(&file);
+
+        assert_eq!(header.compression(), Compression::Zlib);
+        assert_eq!(tags, body[6..]);
+        assert!(first_tag_was_progressive);
+    }
 }
