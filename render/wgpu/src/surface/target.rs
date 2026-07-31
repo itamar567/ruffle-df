@@ -5,6 +5,7 @@ use crate::descriptors::Descriptors;
 use crate::globals::Globals;
 use crate::utils::create_buffer_with_data;
 use crate::utils::run_copy_pipeline;
+use ruffle_render::bitmap::PixelRegion;
 use std::cell::OnceCell;
 use std::sync::Arc;
 
@@ -58,7 +59,6 @@ impl ResolveBuffer {
 #[derive(Debug)]
 pub struct FrameBuffer {
     texture: PoolOrArcTexture,
-    size: wgpu::Extent3d,
 }
 
 #[derive(Debug)]
@@ -99,17 +99,15 @@ impl FrameBuffer {
 
         Self {
             texture: PoolOrArcTexture::Pool(texture),
-            size,
         }
     }
 
-    pub fn new_manual(texture: wgpu::Texture, size: wgpu::Extent3d) -> Self {
+    pub fn new_manual(texture: wgpu::Texture) -> Self {
         Self {
             texture: PoolOrArcTexture::Manual((
                 texture.clone(),
                 texture.create_view(&Default::default()),
             )),
-            size,
         }
     }
 
@@ -129,10 +127,6 @@ impl FrameBuffer {
 
     pub fn take_texture(self) -> PoolOrArcTexture {
         self.texture
-    }
-
-    pub fn size(&self) -> wgpu::Extent3d {
-        self.size
     }
 }
 
@@ -193,10 +187,10 @@ impl StencilBuffer {
 
 pub struct CommandTarget {
     frame_buffer: FrameBuffer,
-    blend_buffer: OnceCell<BlendBuffer>,
     resolve_buffer: Option<ResolveBuffer>,
     depth: OnceCell<StencilBuffer>,
     globals: Arc<Globals>,
+    viewport: PixelRegion,
     size: wgpu::Extent3d,
     format: wgpu::TextureFormat,
     sample_count: u32,
@@ -215,7 +209,32 @@ impl CommandTarget {
         render_target_mode: RenderTargetMode,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Self {
-        let globals = pool.get_globals(descriptors, size.width, size.height);
+        Self::for_viewport(
+            descriptors,
+            pool,
+            PixelRegion::for_whole_size(size.width, size.height),
+            format,
+            sample_count,
+            render_target_mode,
+            encoder,
+        )
+    }
+
+    pub fn for_viewport(
+        descriptors: &Descriptors,
+        pool: &mut TexturePool,
+        viewport: PixelRegion,
+        format: wgpu::TextureFormat,
+        sample_count: u32,
+        render_target_mode: RenderTargetMode,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Self {
+        let size = wgpu::Extent3d {
+            width: viewport.width(),
+            height: viewport.height(),
+            depth_or_array_layers: 1,
+        };
+        let globals = pool.get_globals(descriptors, viewport);
 
         let mut make_pooled_frame_buffer = || {
             FrameBuffer::new(
@@ -245,10 +264,7 @@ impl CommandTarget {
                         Some(ResolveBuffer::new_manual(texture.clone())),
                     )
                 } else {
-                    (
-                        FrameBuffer::new_manual(texture.clone(), texture.size()),
-                        None,
-                    )
+                    (FrameBuffer::new_manual(texture.clone()), None)
                 }
             } else if sample_count > 1 {
                 (
@@ -287,7 +303,7 @@ impl CommandTarget {
                     format,
                     frame_buffer.texture.view(),
                     &texture.create_view(&Default::default()),
-                    get_whole_frame_bind_group(&whole_frame_bind_group, descriptors, size),
+                    get_whole_frame_bind_group(&whole_frame_bind_group, descriptors, viewport),
                     &globals,
                     sample_count,
                     encoder,
@@ -303,10 +319,10 @@ impl CommandTarget {
 
         Self {
             frame_buffer,
-            blend_buffer: OnceCell::new(),
             resolve_buffer,
             depth: OnceCell::new(),
             globals,
+            viewport,
             size,
             format,
             sample_count,
@@ -322,6 +338,19 @@ impl CommandTarget {
 
     pub fn height(&self) -> u32 {
         self.size.height
+    }
+
+    pub fn viewport(&self) -> PixelRegion {
+        self.viewport
+    }
+
+    pub fn local_region(&self, region: PixelRegion) -> PixelRegion {
+        PixelRegion::for_region(
+            region.x_min - self.viewport.x_min,
+            region.y_min - self.viewport.y_min,
+            region.width(),
+            region.height(),
+        )
     }
 
     pub fn ensure_cleared(&self, encoder: &mut wgpu::CommandEncoder) {
@@ -350,7 +379,7 @@ impl CommandTarget {
     }
 
     pub fn whole_frame_bind_group(&self, descriptors: &Descriptors) -> &wgpu::BindGroup {
-        get_whole_frame_bind_group(&self.whole_frame_bind_group, descriptors, self.size)
+        get_whole_frame_bind_group(&self.whole_frame_bind_group, descriptors, self.viewport)
     }
 
     pub fn color_attachments(&self) -> Option<wgpu::RenderPassColorAttachment<'_>> {
@@ -398,23 +427,28 @@ impl CommandTarget {
         })
     }
 
-    pub fn update_blend_buffer(
+    pub fn copy_region_to_blend_buffer(
         &self,
+        region: PixelRegion,
         descriptors: &Descriptors,
         pool: &mut TexturePool,
         encoder: &mut wgpu::CommandEncoder,
-    ) -> &BlendBuffer {
-        let blend_buffer = self.blend_buffer.get_or_init(|| {
-            BlendBuffer::new(
-                descriptors,
-                self.size,
-                self.format,
-                wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_DST
-                    | wgpu::TextureUsages::COPY_SRC,
-                pool,
-            )
-        });
+    ) -> BlendBuffer {
+        let local_region = self.local_region(region);
+        let size = wgpu::Extent3d {
+            width: local_region.width(),
+            height: local_region.height(),
+            depth_or_array_layers: 1,
+        };
+        let blend_buffer = BlendBuffer::new(
+            descriptors,
+            size,
+            self.format,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            pool,
+        );
         self.ensure_cleared(encoder);
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
@@ -424,7 +458,11 @@ impl CommandTarget {
                     .map(|b| b.texture())
                     .unwrap_or_else(|| self.frame_buffer.texture()),
                 mip_level: 0,
-                origin: Default::default(),
+                origin: wgpu::Origin3d {
+                    x: local_region.x_min,
+                    y: local_region.y_min,
+                    z: 0,
+                },
                 aspect: Default::default(),
             },
             wgpu::TexelCopyTextureInfo {
@@ -433,7 +471,7 @@ impl CommandTarget {
                 origin: Default::default(),
                 aspect: Default::default(),
             },
-            self.frame_buffer.size(),
+            size,
         );
         blend_buffer
     }
@@ -456,38 +494,42 @@ impl CommandTarget {
 fn get_whole_frame_bind_group<'a>(
     once_cell: &'a OnceCell<(wgpu::Buffer, wgpu::BindGroup)>,
     descriptors: &Descriptors,
-    size: wgpu::Extent3d,
+    viewport: PixelRegion,
 ) -> &'a wgpu::BindGroup {
     &once_cell
-        .get_or_init(|| {
-            let transform = Transforms {
-                world_matrix: [
-                    [size.width as f32, 0.0, 0.0, 0.0],
-                    [0.0, size.height as f32, 0.0, 0.0],
-                    [0.0, 0.0, 1.0, 0.0],
-                    [0.0, 0.0, 0.0, 1.0],
-                ],
-                mult_color: [1.0, 1.0, 1.0, 1.0],
-                add_color: [0.0, 0.0, 0.0, 0.0],
-            };
-            let transforms_buffer = create_buffer_with_data(
-                &descriptors.device,
-                bytemuck::cast_slice(&[transform]),
-                wgpu::BufferUsages::UNIFORM,
-                create_debug_label!("Whole-frame transforms buffer"),
-            );
-            let whole_frame_bind_group =
-                descriptors
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        layout: &descriptors.bind_layouts.transforms,
-                        entries: &[wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: transforms_buffer.as_entire_binding(),
-                        }],
-                        label: create_debug_label!("Whole-frame transforms bind group").as_deref(),
-                    });
-            (transforms_buffer, whole_frame_bind_group)
-        })
+        .get_or_init(|| create_region_bind_group(descriptors, viewport))
         .1
+}
+
+pub fn create_region_bind_group(
+    descriptors: &Descriptors,
+    viewport: PixelRegion,
+) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let transform = Transforms {
+        world_matrix: [
+            [viewport.width() as f32, 0.0, 0.0, 0.0],
+            [0.0, viewport.height() as f32, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [viewport.x_min as f32, viewport.y_min as f32, 0.0, 1.0],
+        ],
+        mult_color: [1.0, 1.0, 1.0, 1.0],
+        add_color: [0.0, 0.0, 0.0, 0.0],
+    };
+    let transforms_buffer = create_buffer_with_data(
+        &descriptors.device,
+        bytemuck::cast_slice(&[transform]),
+        wgpu::BufferUsages::UNIFORM,
+        create_debug_label!("Region transforms buffer"),
+    );
+    let bind_group = descriptors
+        .device
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &descriptors.bind_layouts.transforms,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: transforms_buffer.as_entire_binding(),
+            }],
+            label: create_debug_label!("Region transforms bind group").as_deref(),
+        });
+    (transforms_buffer, bind_group)
 }

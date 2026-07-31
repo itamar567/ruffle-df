@@ -1,5 +1,6 @@
 //use super::utils::create_debug_label;
 use bytemuck::{Pod, Zeroable};
+use ruffle_render::bitmap::PixelRegion;
 use wgpu::util::DeviceExt;
 
 #[derive(Debug)]
@@ -14,24 +15,36 @@ pub struct GlobalsUniform {
     view_matrix: [[f32; 4]; 4],
 }
 
+impl GlobalsUniform {
+    fn for_viewport(viewport: PixelRegion) -> Self {
+        let width = viewport.width() as f32;
+        let height = viewport.height() as f32;
+        Self {
+            view_matrix: [
+                [2.0 / width, 0.0, 0.0, 0.0],
+                [0.0, -2.0 / height, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [
+                    -1.0 - 2.0 * viewport.x_min as f32 / width,
+                    1.0 + 2.0 * viewport.y_min as f32 / height,
+                    0.0,
+                    1.0,
+                ],
+            ],
+        }
+    }
+}
+
 impl Globals {
     pub fn new(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
-        viewport_width: u32,
-        viewport_height: u32,
+        viewport: PixelRegion,
     ) -> Self {
         let temp_label = create_debug_label!("Globals buffer");
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: temp_label.as_deref(),
-            contents: bytemuck::cast_slice(&[GlobalsUniform {
-                view_matrix: [
-                    [1.0 / (viewport_width as f32 / 2.0), 0.0, 0.0, 0.0],
-                    [0.0, -1.0 / (viewport_height as f32 / 2.0), 0.0, 0.0],
-                    [0.0, 0.0, 1.0, 0.0],
-                    [-1.0, 1.0, 0.0, 1.0],
-                ],
-            }]),
+            contents: bytemuck::cast_slice(&[GlobalsUniform::for_viewport(viewport)]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
@@ -53,5 +66,20 @@ impl Globals {
 
     pub fn bind_group(&self) -> &wgpu::BindGroup {
         &self.bind_group
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GlobalsUniform;
+    use ruffle_render::bitmap::PixelRegion;
+
+    #[test]
+    fn view_matrix_offsets_coordinates_to_viewport_origin() {
+        let uniform = GlobalsUniform::for_viewport(PixelRegion::for_region(100, 50, 400, 200));
+
+        assert_eq!(uniform.view_matrix[0][0], 0.005);
+        assert_eq!(uniform.view_matrix[1][1], -0.01);
+        assert_eq!(uniform.view_matrix[3], [-1.5, 1.5, 0.0, 1.0]);
     }
 }

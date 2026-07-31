@@ -879,7 +879,7 @@ impl CommandHandler for WebCanvasRenderBackend {
         }
     }
 
-    fn blend(&mut self, commands: CommandList, blend: RenderBlendMode) {
+    fn blend(&mut self, commands: CommandList, blend: RenderBlendMode, _bounds: PixelRegion) {
         self.push_blend_mode(blend);
         commands.execute(self);
         self.pop_blend_mode();

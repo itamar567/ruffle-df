@@ -9,7 +9,7 @@ use crate::surface::Surface;
 use crate::surface::target::CommandTarget;
 use crate::{Descriptors, MaskState, Pipelines, Transforms, as_texture};
 use ruffle_render::backend::ShapeHandle;
-use ruffle_render::bitmap::{BitmapHandle, PixelSnapping};
+use ruffle_render::bitmap::{BitmapHandle, PixelRegion, PixelSnapping};
 use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::lines::{emulate_line, emulate_line_rect};
 use ruffle_render::matrix::Matrix;
@@ -444,6 +444,7 @@ pub enum Chunk {
         texture: PoolOrArcTexture,
         blend_mode: ChunkBlendMode,
         needs_stencil: bool,
+        viewport: PixelRegion,
     },
 }
 
@@ -511,8 +512,7 @@ pub fn chunk_blends<'a>(
     draw_encoder: &mut wgpu::CommandEncoder,
     meshes: &'a Vec<Mesh>,
     quality: StageQuality,
-    width: u32,
-    height: u32,
+    viewport: PixelRegion,
     nearest_layer: LayerRef,
     texture_pool: &mut TexturePool,
 ) -> Vec<Chunk> {
@@ -523,8 +523,7 @@ pub fn chunk_blends<'a>(
         draw_encoder,
         meshes,
         quality,
-        width,
-        height,
+        viewport,
         nearest_layer,
         texture_pool,
     )
@@ -534,8 +533,7 @@ pub fn chunk_blends<'a>(
 struct WgpuCommandHandler<'a> {
     descriptors: &'a Descriptors,
     quality: StageQuality,
-    width: u32,
-    height: u32,
+    viewport: PixelRegion,
     nearest_layer: LayerRef<'a>,
     meshes: &'a Vec<Mesh>,
     staging_belt: &'a mut wgpu::util::StagingBelt,
@@ -560,8 +558,7 @@ impl<'a> WgpuCommandHandler<'a> {
         draw_encoder: &'a mut wgpu::CommandEncoder,
         meshes: &'a Vec<Mesh>,
         quality: StageQuality,
-        width: u32,
-        height: u32,
+        viewport: PixelRegion,
         nearest_layer: LayerRef<'a>,
         texture_pool: &'a mut TexturePool,
     ) -> Self {
@@ -575,8 +572,7 @@ impl<'a> WgpuCommandHandler<'a> {
         Self {
             descriptors,
             quality,
-            width,
-            height,
+            viewport,
             nearest_layer,
             meshes,
             staging_belt,
@@ -674,12 +670,20 @@ impl<'a> WgpuCommandHandler<'a> {
 }
 
 impl CommandHandler for WgpuCommandHandler<'_> {
-    fn blend(&mut self, commands: CommandList, blend_mode: RenderBlendMode) {
-        let surface = Surface::new(
+    fn blend(&mut self, commands: CommandList, blend_mode: RenderBlendMode, bounds: PixelRegion) {
+        // Pixel Bender shaders can observe global coordinates through outCoord().
+        let viewport = if matches!(&blend_mode, RenderBlendMode::Shader(_)) {
+            self.viewport
+        } else {
+            bounds.intersection(self.viewport)
+        };
+        if viewport.width() == 0 || viewport.height() == 0 {
+            return;
+        }
+        let surface = Surface::for_viewport(
             self.descriptors,
             self.quality,
-            self.width,
-            self.height,
+            viewport,
             wgpu::TextureFormat::Rgba8Unorm,
         );
         let target_layer = if let RenderBlendMode::Builtin(BlendMode::Layer) = &blend_mode {
@@ -717,7 +721,13 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         match blend_type {
             BlendType::Trivial(blend_mode) => {
                 let transform = Transform {
-                    matrix: Matrix::scale(target.width() as f32, target.height() as f32),
+                    matrix: Matrix {
+                        a: target.width() as f32,
+                        d: target.height() as f32,
+                        tx: Twips::from_pixels(viewport.x_min as f64),
+                        ty: Twips::from_pixels(viewport.y_min as f64),
+                        ..Default::default()
+                    },
                     color_transform: Default::default(),
                     perspective_projection: None,
                 };
@@ -782,6 +792,7 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                     texture: target.take_color_texture(),
                     blend_mode: chunk_blend_mode,
                     needs_stencil: self.num_masks > 0,
+                    viewport,
                 });
                 self.needs_stencil = self.num_masks > 0;
             }
@@ -908,11 +919,10 @@ impl CommandHandler for WgpuCommandHandler<'_> {
     }
 
     fn render_alpha_mask(&mut self, maskee_commands: CommandList, mask_commands: CommandList) {
-        let surface = Surface::new(
+        let surface = Surface::for_viewport(
             self.descriptors,
             self.quality,
-            self.width,
-            self.height,
+            self.viewport,
             wgpu::TextureFormat::Rgba8Unorm,
         );
 
@@ -928,7 +938,13 @@ impl CommandHandler for WgpuCommandHandler<'_> {
             self.texture_pool,
         );
         maskee.ensure_cleared(self.draw_encoder);
-        let matrix = Matrix::scale(maskee.width() as f32, maskee.height() as f32);
+        let matrix = Matrix {
+            a: maskee.width() as f32,
+            d: maskee.height() as f32,
+            tx: Twips::from_pixels(self.viewport.x_min as f64),
+            ty: Twips::from_pixels(self.viewport.y_min as f64),
+            ..Default::default()
+        };
         let maskee = maskee.take_color_texture();
 
         let mask = surface.draw_commands(

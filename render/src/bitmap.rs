@@ -364,7 +364,7 @@ fn translate_region(
     )
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PixelRegion {
     pub x_min: u32,
     pub y_min: u32,
@@ -479,6 +479,17 @@ impl PixelRegion {
             && self.y_max >= other.y_min
     }
 
+    pub fn intersection(self, other: PixelRegion) -> Self {
+        let x_min = self.x_min.max(other.x_min);
+        let y_min = self.y_min.max(other.y_min);
+        Self {
+            x_min,
+            y_min,
+            x_max: self.x_max.min(other.x_max).max(x_min),
+            y_max: self.y_max.min(other.y_max).max(y_min),
+        }
+    }
+
     pub fn width(&self) -> u32 {
         self.x_max - self.x_min
     }
@@ -573,6 +584,31 @@ impl From<Rectangle<Twips>> for PixelRegion {
 #[cfg(test)]
 mod test {
     use super::PixelRegion;
+
+    #[test]
+    fn intersection_returns_overlap() {
+        let first = PixelRegion::for_region(10, 20, 30, 40);
+        let second = PixelRegion::for_region(20, 10, 30, 30);
+
+        assert_eq!(
+            first.intersection(second),
+            PixelRegion {
+                x_min: 20,
+                y_min: 20,
+                x_max: 40,
+                y_max: 40,
+            }
+        );
+    }
+
+    #[test]
+    fn intersection_returns_empty_region_for_disjoint_regions() {
+        let first = PixelRegion::for_region(10, 20, 30, 40);
+        let second = PixelRegion::for_region(50, 70, 10, 10);
+
+        assert_eq!(first.intersection(second).width(), 0);
+        assert_eq!(first.intersection(second).height(), 0);
+    }
 
     #[test]
     fn clamp_with_intersection() {

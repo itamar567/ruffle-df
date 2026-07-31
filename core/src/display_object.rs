@@ -1154,7 +1154,14 @@ pub fn render_base<'gc>(
             } else {
                 RenderBlendMode::Builtin(blend_mode.try_into().unwrap())
             };
-            context.commands.blend(sub_commands, render_blend_mode);
+            let bounds = this.render_bounds_with_transform(
+                &context.transform_stack.transform().matrix,
+                true,
+                &context.stage.view_matrix(),
+            );
+            context
+                .commands
+                .blend(sub_commands, render_blend_mode, bounds.into());
         }
     }
 

@@ -11,11 +11,12 @@ use crate::pixel_bender::{ShaderMode, run_pixelbender_shader_impl};
 use crate::surface::commands::{Chunk, CommandRenderer, chunk_blends};
 use crate::utils::supported_sample_count;
 use crate::{Descriptors, MaskState, Pipelines};
+use ruffle_render::bitmap::PixelRegion;
 use ruffle_render::commands::CommandList;
 use ruffle_render::pixel_bender_support::{ImageInputTexture, PixelBenderShaderArgument};
 use ruffle_render::quality::StageQuality;
 use std::sync::Arc;
-use target::CommandTarget;
+use target::{CommandTarget, create_region_bind_group};
 use tracing::instrument;
 
 use crate::utils::run_copy_pipeline;
@@ -26,6 +27,7 @@ use self::commands::ChunkBlendMode;
 
 #[derive(Debug)]
 pub struct Surface {
+    viewport: PixelRegion,
     size: wgpu::Extent3d,
     quality: StageQuality,
     sample_count: u32,
@@ -41,9 +43,23 @@ impl Surface {
         height: u32,
         frame_buffer_format: wgpu::TextureFormat,
     ) -> Self {
+        Self::for_viewport(
+            descriptors,
+            quality,
+            PixelRegion::for_whole_size(width, height),
+            frame_buffer_format,
+        )
+    }
+
+    pub fn for_viewport(
+        descriptors: &Descriptors,
+        quality: StageQuality,
+        viewport: PixelRegion,
+        frame_buffer_format: wgpu::TextureFormat,
+    ) -> Self {
         let size = wgpu::Extent3d {
-            width,
-            height,
+            width: viewport.width(),
+            height: viewport.height(),
             depth_or_array_layers: 1,
         };
 
@@ -54,6 +70,7 @@ impl Surface {
         );
         let pipelines = descriptors.pipelines(sample_count, frame_buffer_format);
         Self {
+            viewport,
             size,
             quality,
             sample_count,
@@ -115,10 +132,10 @@ impl Surface {
         nearest_layer: LayerRef<'frame>,
         texture_pool: &mut TexturePool,
     ) -> CommandTarget {
-        let target = CommandTarget::new(
+        let target = CommandTarget::for_viewport(
             descriptors,
             texture_pool,
-            self.size,
+            self.viewport,
             self.format,
             self.sample_count,
             render_target_mode,
@@ -135,8 +152,7 @@ impl Surface {
             draw_encoder,
             meshes,
             self.quality,
-            target.width(),
-            target.height(),
+            target.viewport(),
             match nearest_layer {
                 LayerRef::Current => LayerRef::Parent(&target),
                 layer => layer,
@@ -198,10 +214,15 @@ impl Surface {
                     texture,
                     blend_mode: ChunkBlendMode::Shader(shader),
                     needs_stencil,
+                    viewport,
                 } => {
                     assert!(!needs_stencil, "Shader blend mode not implemented in masks");
-                    let parent_blend_buffer =
-                        target.update_blend_buffer(descriptors, texture_pool, draw_encoder);
+                    let parent_blend_buffer = target.copy_region_to_blend_buffer(
+                        viewport,
+                        descriptors,
+                        texture_pool,
+                        draw_encoder,
+                    );
                     run_pixelbender_shader_impl(
                         descriptors,
                         shader,
@@ -234,6 +255,7 @@ impl Surface {
                     texture,
                     blend_mode: ChunkBlendMode::Complex(blend_mode),
                     needs_stencil,
+                    viewport,
                 } => {
                     let parent = match blend_mode {
                         ComplexBlend::Alpha | ComplexBlend::Erase => {
@@ -249,8 +271,12 @@ impl Surface {
                         _ => &target,
                     };
 
-                    let parent_blend_buffer =
-                        parent.update_blend_buffer(descriptors, texture_pool, draw_encoder);
+                    let parent_blend_buffer = parent.copy_region_to_blend_buffer(
+                        viewport,
+                        descriptors,
+                        texture_pool,
+                        draw_encoder,
+                    );
 
                     let blend_bind_group =
                         descriptors
@@ -289,6 +315,8 @@ impl Surface {
                                 ],
                             });
 
+                    let (_region_buffer, region_bind_group) =
+                        create_region_bind_group(descriptors, viewport);
                     let mut render_pass =
                         draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: create_debug_label!(
@@ -333,7 +361,7 @@ impl Surface {
                         );
                     }
 
-                    render_pass.set_bind_group(1, target.whole_frame_bind_group(descriptors), &[0]);
+                    render_pass.set_bind_group(1, &region_bind_group, &[0]);
                     render_pass.set_bind_group(2, &blend_bind_group, &[]);
 
                     render_pass.set_vertex_buffer(0, descriptors.quad.vertices_pos.slice(..));

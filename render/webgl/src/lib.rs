@@ -1556,7 +1556,7 @@ impl CommandHandler for WebGlRenderBackend {
         self.mask_state_dirty = true;
     }
 
-    fn blend(&mut self, commands: CommandList, blend: RenderBlendMode) {
+    fn blend(&mut self, commands: CommandList, blend: RenderBlendMode, _bounds: PixelRegion) {
         self.push_blend_mode(blend);
         commands.execute(self);
         self.pop_blend_mode();

@@ -1,6 +1,7 @@
 use crate::descriptors::Descriptors;
 use crate::globals::Globals;
 use fnv::FnvHashMap;
+use ruffle_render::bitmap::PixelRegion;
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, Weak};
@@ -11,7 +12,7 @@ type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> 
 #[derive(Debug, Default)]
 pub struct TexturePool {
     pools: FnvHashMap<TextureKey, BufferPool<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>>,
-    globals_cache: FnvHashMap<GlobalsKey, Arc<Globals>>,
+    globals_cache: FnvHashMap<PixelRegion, Arc<Globals>>,
 }
 
 impl TexturePool {
@@ -63,20 +64,15 @@ impl TexturePool {
     pub fn get_globals(
         &mut self,
         descriptors: &Descriptors,
-        viewport_width: u32,
-        viewport_height: u32,
+        viewport: PixelRegion,
     ) -> Arc<Globals> {
         self.globals_cache
-            .entry(GlobalsKey {
-                viewport_width,
-                viewport_height,
-            })
+            .entry(viewport)
             .or_insert_with(|| {
                 Arc::new(Globals::new(
                     &descriptors.device,
                     &descriptors.bind_layouts.globals,
-                    viewport_width,
-                    viewport_height,
+                    viewport,
                 ))
             })
             .clone()
@@ -89,12 +85,6 @@ struct TextureKey {
     usage: wgpu::TextureUsages,
     format: wgpu::TextureFormat,
     sample_count: u32,
-}
-
-#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
-struct GlobalsKey {
-    viewport_width: u32,
-    viewport_height: u32,
 }
 
 pub trait BufferDescription: Clone + Debug {
