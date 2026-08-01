@@ -223,6 +223,39 @@ impl std::fmt::Debug for FontFileData {
     }
 }
 
+const GLYPH_CACHE_PAGE_SIZE: usize = 256;
+
+type GlyphCachePage = [OnceCell<Option<Glyph>>; GLYPH_CACHE_PAGE_SIZE];
+
+#[derive(Debug)]
+struct GlyphCache {
+    pages: Box<[OnceCell<Box<GlyphCachePage>>]>,
+    glyph_count: usize,
+}
+
+impl GlyphCache {
+    fn new(glyph_count: usize) -> Self {
+        let page_count = glyph_count.div_ceil(GLYPH_CACHE_PAGE_SIZE);
+        Self {
+            pages: (0..page_count)
+                .map(|_| OnceCell::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            glyph_count,
+        }
+    }
+
+    fn get_or_create(&self, glyph_index: usize) -> Option<&OnceCell<Option<Glyph>>> {
+        if glyph_index >= self.glyph_count {
+            return None;
+        }
+
+        let page = self.pages[glyph_index / GLYPH_CACHE_PAGE_SIZE]
+            .get_or_init(|| Box::new(std::array::from_fn(|_| OnceCell::new())));
+        Some(&page[glyph_index % GLYPH_CACHE_PAGE_SIZE])
+    }
+}
+
 /// Represents a raw font file (ie .ttf).
 /// This should be shared and reused where possible, and it's reparsed every time a new glyph is required.
 ///
@@ -233,7 +266,7 @@ impl std::fmt::Debug for FontFileData {
 #[derive(Debug)]
 pub struct FontFace {
     data: FontFileData,
-    glyphs: Vec<OnceCell<Option<Glyph>>>,
+    glyphs: GlyphCache,
     font_index: u32,
 
     ascender: i32,
@@ -254,7 +287,7 @@ impl FontFace {
         let descender = -face.descender() as i32;
         let leading = face.line_gap();
         let scale = face.units_per_em() as f32;
-        let glyphs = vec![OnceCell::new(); face.number_of_glyphs() as usize];
+        let glyphs = GlyphCache::new(face.number_of_glyphs() as usize);
 
         // [NA] TODO: This is technically correct for just Kerning, but in practice kerning comes in many forms.
         // We need to support GPOS to do better at this, but that's a bigger change to font rendering as a whole.
@@ -284,7 +317,9 @@ impl FontFace {
         let face = ttf_parser::Face::parse(&self.data, self.font_index)
             .expect("Font was already checked to be valid");
         if let Some(glyph_id) = face.glyph_index(character) {
-            return self.glyphs[glyph_id.0 as usize]
+            return self
+                .glyphs
+                .get_or_create(glyph_id.0 as usize)?
                 .get_or_init(|| {
                     let mut drawing = Drawing::new();
                     // TTF uses NonZero
@@ -1558,5 +1593,34 @@ impl<'gc> FontLike<'gc> for FontSet<'gc> {
 
     fn font_type(&self) -> FontType {
         self.0.main_font.font_type()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glyph_cache_allocates_pages_lazily() {
+        let cache = GlyphCache::new(GLYPH_CACHE_PAGE_SIZE + 1);
+
+        assert_eq!(cache.pages.len(), 2);
+        assert!(cache.pages.iter().all(|page| page.get().is_none()));
+
+        cache.get_or_create(0).unwrap();
+        cache.get_or_create(GLYPH_CACHE_PAGE_SIZE - 1).unwrap();
+        assert!(cache.pages[0].get().is_some());
+        assert!(cache.pages[1].get().is_none());
+
+        cache.get_or_create(GLYPH_CACHE_PAGE_SIZE).unwrap();
+        assert!(cache.pages[1].get().is_some());
+    }
+
+    #[test]
+    fn glyph_cache_rejects_out_of_bounds_indices() {
+        let cache = GlyphCache::new(1);
+
+        assert!(cache.get_or_create(1).is_none());
+        assert!(cache.pages[0].get().is_none());
     }
 }
