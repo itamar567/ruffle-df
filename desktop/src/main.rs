@@ -31,16 +31,30 @@ use ruffle_core::StaticCallstack;
 use std::cell::RefCell;
 use std::env;
 use std::fs::File;
+use std::io::Write;
 use std::panic::PanicHookInfo;
 use tracing_subscriber::fmt::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use url::Url;
 
+const LOG_BUFFERED_LINES_LIMIT: usize = 8_192;
+
 thread_local! {
     static CALLSTACK: RefCell<Option<StaticCallstack>> = RefCell::default();
     static RENDER_INFO: RefCell<Option<String>> = RefCell::default();
     static SWF_INFO: RefCell<Option<String>> = RefCell::default();
+}
+
+fn non_blocking_writer(
+    writer: impl Write + Send + 'static,
+) -> (
+    tracing_appender::non_blocking::NonBlocking,
+    tracing_appender::non_blocking::WorkerGuard,
+) {
+    tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .buffered_lines_limit(LOG_BUFFERED_LINES_LIMIT)
+        .finish(writer)
 }
 
 #[cfg(feature = "tracy")]
@@ -163,8 +177,8 @@ fn main() -> Result<(), Error> {
 
     // [NA] `_guard` cannot be `_` or it'll immediately drop
     // https://docs.rs/tracing-appender/latest/tracing_appender/non_blocking/index.html
-    let (non_blocking_file, _file_guard) = tracing_appender::non_blocking(File::create(log_path)?);
-    let (non_blocking_stdout, _stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
+    let (non_blocking_file, _file_guard) = non_blocking_writer(File::create(log_path)?);
+    let (non_blocking_stdout, _stdout_guard) = non_blocking_writer(std::io::stdout());
 
     let env_filter = tracing_subscriber::EnvFilter::builder().parse_lossy(
         env::var("RUST_LOG")
@@ -230,4 +244,17 @@ fn migrate_logs(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LOG_BUFFERED_LINES_LIMIT;
+
+    #[test]
+    fn logging_queue_has_a_small_power_of_two_capacity() {
+        assert!(LOG_BUFFERED_LINES_LIMIT.is_power_of_two());
+        assert!(
+            LOG_BUFFERED_LINES_LIMIT < tracing_appender::non_blocking::DEFAULT_BUFFERED_LINES_LIMIT
+        );
+    }
 }
