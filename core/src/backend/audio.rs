@@ -6,6 +6,7 @@ use crate::{
     context::UpdateContext,
     display_object::{self, DisplayObject, MovieClip, TDisplayObject},
     string::AvmString,
+    tag_utils::SwfSlice,
 };
 use gc_arena::Collect;
 pub use ruffle_common::buffer::Substream;
@@ -45,6 +46,12 @@ new_key_type! {
 }
 
 pub type DecodeError = decoders::Error;
+
+pub struct RegisteredSound {
+    pub format: swf::SoundFormat,
+    pub data: SwfSlice,
+    pub num_samples: u32,
+}
 
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
 pub enum SoundStreamWrapping {
@@ -98,8 +105,11 @@ pub trait AudioBackend: Any {
     fn play(&mut self);
     fn pause(&mut self);
 
-    /// Registers an sound embedded in an SWF.
-    fn register_sound(&mut self, swf_sound: &swf::Sound) -> Result<SoundHandle, RegisterError>;
+    /// Registers a sound embedded in an SWF.
+    fn register_sound(&mut self, sound: RegisteredSound) -> Result<SoundHandle, RegisterError>;
+
+    /// Releases a registered sound that is no longer reachable.
+    fn unregister_sound(&mut self, sound: SoundHandle);
 
     /// Registers MP3 audio from an external source.
     fn register_mp3(&mut self, data: &[u8]) -> Result<SoundHandle, DecodeError>;
@@ -234,15 +244,14 @@ impl NullAudioBackend {
 impl AudioBackend for NullAudioBackend {
     fn play(&mut self) {}
     fn pause(&mut self) {}
-    fn register_sound(&mut self, sound: &swf::Sound) -> Result<SoundHandle, RegisterError> {
-        // Slice off latency seek for MP3 data.
+    fn register_sound(&mut self, sound: RegisteredSound) -> Result<SoundHandle, RegisterError> {
+        let data = sound.data.data();
         let data = if sound.format.compression == swf::AudioCompression::Mp3 {
-            sound.data.get(2..).ok_or(RegisterError::ShortMp3)?
+            data.get(2..).ok_or(RegisterError::ShortMp3)?
         } else {
-            sound.data
+            data
         };
 
-        // AS duration does not subtract `skip_sample_frames`.
         let num_sample_frames: f64 = sound.num_samples.into();
         let sample_rate: f64 = sound.format.sample_rate.into();
         let duration = FloatDuration::from_millis(num_sample_frames * 1000.0 / sample_rate);
@@ -250,8 +259,12 @@ impl AudioBackend for NullAudioBackend {
         Ok(self.sounds.insert(NullSound {
             duration,
             size: data.len() as u32,
-            format: sound.format.clone(),
+            format: sound.format,
         }))
+    }
+
+    fn unregister_sound(&mut self, sound: SoundHandle) {
+        self.sounds.remove(sound);
     }
 
     fn register_mp3(&mut self, _data: &[u8]) -> Result<SoundHandle, DecodeError> {
@@ -338,6 +351,21 @@ impl AudioBackend for NullAudioBackend {
 impl Default for NullAudioBackend {
     fn default() -> Self {
         NullAudioBackend::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unregister_sound_releases_registered_sound() {
+        let mut audio = NullAudioBackend::new();
+        let sound = audio.register_mp3(&[]).unwrap();
+
+        assert!(audio.get_sound_format(sound).is_some());
+        audio.unregister_sound(sound);
+        assert!(audio.get_sound_format(sound).is_none());
     }
 }
 

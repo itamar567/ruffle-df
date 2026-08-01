@@ -63,7 +63,7 @@ use async_channel::Sender;
 use enumset::EnumSet;
 use gc_arena::arena::CollectionPhase;
 use gc_arena::lock::GcRefLock;
-use gc_arena::{Collect, DynamicRootSet, Finalization, Mutation, Rootable};
+use gc_arena::{Collect, DynamicRootSet, Mutation, Rootable};
 use ruffle_common::duration::FloatDuration;
 use ruffle_macros::istr;
 use ruffle_render::backend::{RenderBackend, ViewportDimensions, null::NullRenderer};
@@ -2391,32 +2391,33 @@ impl Player {
         self.debug_ui.borrow_mut()
     }
 
-    fn remove_dead_movie_libraries<'gc>(
-        fc: &'gc Finalization<'gc>,
-        root: &'gc GcRoot<'gc>,
+    fn finish_gc_cycle(
+        arena: &mut GcArena,
+        removed_sounds: &mut Vec<crate::backend::audio::SoundHandle>,
     ) -> bool {
-        root.data
-            .borrow_mut(fc)
-            .library
-            .remove_dead_movie_libraries(fc)
-    }
-
-    fn finish_gc_cycle(arena: &mut GcArena) -> bool {
         let removed = arena
             .finish_marking()
             .expect("GC marking must finish outside the sweeping phase")
-            .finalize(Self::remove_dead_movie_libraries);
+            .finalize(|fc, root| {
+                root.data
+                    .borrow_mut(fc)
+                    .library
+                    .remove_dead_movie_libraries(fc, removed_sounds)
+            });
         arena.finish_cycle();
         removed
     }
 
     /// Completes any in-progress cycle before collecting dead movie libraries.
-    fn finish_movie_gc(arena: &mut GcArena) {
+    fn finish_movie_gc(
+        arena: &mut GcArena,
+        removed_sounds: &mut Vec<crate::backend::audio::SoundHandle>,
+    ) {
         match arena.collection_phase() {
             CollectionPhase::Sleeping => {}
             CollectionPhase::Sweeping => arena.finish_cycle(),
             CollectionPhase::Marking | CollectionPhase::Marked => {
-                Self::finish_gc_cycle(arena);
+                Self::finish_gc_cycle(arena, removed_sounds);
             }
         }
 
@@ -2425,7 +2426,7 @@ impl Player {
         // are stale; always run a fresh full cycle to observe the current graph.
         // Afterwards, a removed library's already-marked contents need one more
         // cycle to be swept, so keep collecting until a cycle removes nothing.
-        while Self::finish_gc_cycle(arena) {}
+        while Self::finish_gc_cycle(arena, removed_sounds) {}
     }
 
     fn collect_garbage(&mut self) {
@@ -2437,31 +2438,45 @@ impl Player {
             root.avm1.cleanup_removed_clips(mc);
         });
 
-        let mut arena = self.gc_arena.borrow_mut();
+        let mut removed_sounds = Vec::new();
+        {
+            let mut arena = self.gc_arena.borrow_mut();
 
-        // Collect dead movie libraries periodically rather than only when a movie
-        // is loaded or unloaded: an unload leaves transient references (e.g. the
-        // AVM1 execution list) that are only released after the next frame, so a
-        // collection at the moment of the unload would keep the movie alive
-        // anyway. Running a full collection every `MOVIE_GC_INTERVAL` frames
-        // guarantees that unloaded movies are reclaimed shortly after their last
-        // references disappear, whatever the unload path.
-        self.movie_gc_frames += 1;
-        if self.movie_gc_frames >= MOVIE_GC_INTERVAL {
-            self.movie_gc_frames = 0;
-            Self::finish_movie_gc(&mut arena);
-            return;
-        }
+            // Collect dead movie libraries periodically rather than only when a movie
+            // is loaded or unloaded: an unload leaves transient references (e.g. the
+            // AVM1 execution list) that are only released after the next frame, so a
+            // collection at the moment of the unload would keep the movie alive
+            // anyway. Running a full collection every `MOVIE_GC_INTERVAL` frames
+            // guarantees that unloaded movies are reclaimed shortly after their last
+            // references disappear, whatever the unload path.
+            self.movie_gc_frames += 1;
+            if self.movie_gc_frames >= MOVIE_GC_INTERVAL {
+                self.movie_gc_frames = 0;
+                Self::finish_movie_gc(&mut arena, &mut removed_sounds);
+            } else {
+                let removed_library = if let Some(marked) = arena.mark_debt() {
+                    marked.finalize(|fc, root| {
+                        root.data
+                            .borrow_mut(fc)
+                            .library
+                            .remove_dead_movie_libraries(fc, &mut removed_sounds)
+                    })
+                } else {
+                    false
+                };
 
-        if let Some(marked) = arena.mark_debt() {
-            let removed = marked.finalize(Self::remove_dead_movie_libraries);
-            if removed {
-                arena.finish_cycle();
-                Self::finish_movie_gc(&mut arena);
-                return;
+                if removed_library {
+                    arena.finish_cycle();
+                    Self::finish_movie_gc(&mut arena, &mut removed_sounds);
+                } else {
+                    arena.cycle_debt();
+                }
             }
         }
-        arena.cycle_debt();
+
+        for sound in removed_sounds {
+            self.audio.unregister_sound(sound);
+        }
     }
 
     /// Update the current state of the player.
@@ -3481,7 +3496,6 @@ mod tests {
     #[test]
     fn loaded_movie_with_child_is_collected_after_unload() {
         use crate::backend::navigator::{NullExecutor, NullNavigatorBackend};
-        use std::path::Path;
         use swf::{
             Compression, FillStyle, Fixed8, Header, PlaceObject, PlaceObjectAction, Rectangle,
             Shape, ShapeFlag, ShapeRecord, ShapeStyles, Sprite, Tag, Twips,

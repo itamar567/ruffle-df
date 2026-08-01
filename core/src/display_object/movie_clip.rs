@@ -12,7 +12,7 @@ use crate::avm2::{
     Avm2, ClassObject as Avm2ClassObject, FunctionArgs as Avm2FunctionArgs, LoaderInfoObject,
     Object as Avm2Object, StageObject as Avm2StageObject, Value as Avm2Value,
 };
-use crate::backend::audio::{AudioManager, SoundInstanceHandle};
+use crate::backend::audio::{AudioManager, RegisteredSound, SoundInstanceHandle};
 use crate::backend::navigator::Request;
 use crate::backend::ui::MouseCursor;
 use crate::binary_data::BinaryData;
@@ -3884,14 +3884,17 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         reader: &mut SwfStream<'a>,
     ) -> Result<(), Error> {
         let sound = reader.read_define_sound()?;
-        if let Ok(handle) = context.audio.register_sound(&sound) {
+        let id = sound.id;
+        let sound = RegisteredSound {
+            format: sound.format,
+            data: self.swf.to_unbounded_subslice(sound.data),
+            num_samples: sound.num_samples,
+        };
+        if let Ok(handle) = context.audio.register_sound(sound) {
             self.library_mut(context)
-                .register_character(sound.id, Character::Sound(handle));
+                .register_character(id, Character::Sound(handle));
         } else {
-            tracing::error!(
-                "MovieClip::define_sound: Unable to register sound ID {}",
-                sound.id
-            );
+            tracing::error!("MovieClip::define_sound: Unable to register sound ID {id}");
         }
         Ok(())
     }

@@ -1,7 +1,7 @@
 use super::decoders::{
     self, AdpcmDecoder, Decoder, G711ALawDecoder, G711MuLawDecoder, PcmDecoder, SeekableDecoder,
 };
-use super::{SoundHandle, SoundInstanceHandle, SoundStreamInfo, SoundTransform};
+use super::{RegisteredSound, SoundHandle, SoundInstanceHandle, SoundStreamInfo, SoundTransform};
 use crate::backend::audio::{DecodeError, RegisterError};
 use crate::tag_utils::SwfSlice;
 use ruffle_common::buffer::Substream;
@@ -150,7 +150,7 @@ struct Sound {
     /// The audio data of this sound.
     ///
     /// This will be compressed in the format indicated by `format.compression`.
-    data: Arc<[u8]>,
+    data: SoundBuffer,
 
     /// Number of samples in this audio.
     /// This does not include `skip_sample_frames`.
@@ -298,7 +298,7 @@ impl AudioMixer {
     ///  * ActionScript sounds that may have a custom start and loop setting
     fn make_seekable_decoder(
         format: &swf::SoundFormat,
-        data: Cursor<ArcAsRef>,
+        data: Cursor<SoundBuffer>,
     ) -> Result<Box<dyn SeekableDecoder>, decoders::Error> {
         let decoder: Box<dyn SeekableDecoder> = match format.compression {
             AudioCompression::UncompressedUnknownEndian => {
@@ -359,7 +359,7 @@ impl AudioMixer {
         &self,
         sound: &Sound,
         settings: &swf::SoundInfo,
-        data: Cursor<ArcAsRef>,
+        data: Cursor<SoundBuffer>,
     ) -> Result<Box<dyn Stream>, DecodeError> {
         // Instantiate a decoder for the compression that the sound data uses.
         let decoder = Self::make_seekable_decoder(&sound.format, data)?;
@@ -510,31 +510,36 @@ impl AudioMixer {
     }
 
     /// Registers an embedded SWF sound with the audio mixer.
-    pub fn register_sound(&mut self, swf_sound: &swf::Sound) -> Result<SoundHandle, RegisterError> {
-        // Slice off latency seek for MP3 data.
-        let (skip_sample_frames, data) = if swf_sound.format.compression == AudioCompression::Mp3 {
-            if swf_sound.data.len() < 2 {
+    pub fn register_sound(&mut self, sound: RegisteredSound) -> Result<SoundHandle, RegisterError> {
+        let data = sound.data.data();
+        let (skip_sample_frames, offset) = if sound.format.compression == AudioCompression::Mp3 {
+            if data.len() < 2 {
                 return Err(RegisterError::ShortMp3);
             }
-            let skip_sample_frames = u16::from_le_bytes([swf_sound.data[0], swf_sound.data[1]]);
-            (skip_sample_frames, &swf_sound.data[2..])
+            (u16::from_le_bytes([data[0], data[1]]), 2)
         } else {
-            (0, swf_sound.data)
+            (0, 0)
         };
 
-        let sound = Sound {
-            format: swf_sound.format.clone(),
-            data: Arc::from(data),
-            num_sample_frames: swf_sound.num_samples,
+        Ok(self.sounds.insert(Sound {
+            format: sound.format,
+            data: SoundBuffer::Swf {
+                data: sound.data,
+                offset,
+            },
+            num_sample_frames: sound.num_samples,
             skip_sample_frames,
-        };
-        Ok(self.sounds.insert(sound))
+        }))
+    }
+
+    pub fn unregister_sound(&mut self, sound: SoundHandle) {
+        self.sounds.remove(sound);
     }
 
     /// Registers an external MP3 with the audio mixer.
     #[cfg(feature = "mp3")]
     pub fn register_mp3(&mut self, data: &[u8]) -> Result<SoundHandle, DecodeError> {
-        let data = Arc::from(data);
+        let data: Arc<[u8]> = Arc::from(data);
         // Validate that this is actually MP3 data, and calculate duration and sample rate.
         let metadata = decoders::mp3_metadata(&data)?;
         let sound = Sound {
@@ -544,7 +549,7 @@ impl AudioMixer {
                 is_stereo: true,
                 is_16_bit: true,
             },
-            data,
+            data: SoundBuffer::External(data),
             num_sample_frames: metadata.num_sample_frames,
             skip_sample_frames: 0,
         };
@@ -584,7 +589,7 @@ impl AudioMixer {
         settings: &swf::SoundInfo,
     ) -> Result<SoundInstanceHandle, DecodeError> {
         let sound = &self.sounds[sound_handle];
-        let data = Cursor::new(ArcAsRef(Arc::clone(&sound.data)));
+        let data = Cursor::new(sound.data.clone());
         // Create a stream that decodes and resamples the sound.
         let stream = if sound.skip_sample_frames == 0
             && settings.in_sample.is_none()
@@ -684,7 +689,7 @@ impl AudioMixer {
     }
 
     pub fn get_sound_size(&self, sound: SoundHandle) -> Option<u32> {
-        self.sounds.get(sound).map(|s| s.data.len() as u32)
+        self.sounds.get(sound).map(|s| s.data.as_ref().len() as u32)
     }
 
     pub fn get_sound_format(&self, sound: SoundHandle) -> Option<&swf::SoundFormat> {
@@ -765,20 +770,24 @@ impl AudioMixerProxy {
     }
 }
 
-/// A dummy wrapper struct to implement `AsRef<[u8]>` for `Arc<Vec<u8>>`.
-/// Not having this trait causes problems when trying to use `Cursor<Vec<u8>>`.
-struct ArcAsRef(Arc<[u8]>);
+#[derive(Clone)]
+enum SoundBuffer {
+    Swf { data: SwfSlice, offset: usize },
+    External(Arc<[u8]>),
+}
 
-impl AsRef<[u8]> for ArcAsRef {
-    #[inline]
+impl AsRef<[u8]> for SoundBuffer {
     fn as_ref(&self) -> &[u8] {
-        &self.0
+        match self {
+            Self::Swf { data, offset } => &data.data()[*offset..],
+            Self::External(data) => data,
+        }
     }
 }
 
-impl Default for ArcAsRef {
+impl Default for SoundBuffer {
     fn default() -> Self {
-        ArcAsRef(Arc::new([]))
+        Self::External(Arc::new([]))
     }
 }
 
@@ -1074,8 +1083,16 @@ impl dasp::signal::Signal for EnvelopeSignal {
 macro_rules! impl_audio_mixer_backend {
     ($mixer:ident) => {
         #[inline]
-        fn register_sound(&mut self, swf_sound: &swf::Sound) -> Result<SoundHandle, RegisterError> {
-            self.$mixer.register_sound(swf_sound)
+        fn register_sound(
+            &mut self,
+            sound: $crate::backend::audio::RegisteredSound,
+        ) -> Result<SoundHandle, RegisterError> {
+            self.$mixer.register_sound(sound)
+        }
+
+        #[inline]
+        fn unregister_sound(&mut self, sound: SoundHandle) {
+            self.$mixer.unregister_sound(sound)
         }
 
         #[inline]

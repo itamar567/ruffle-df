@@ -363,6 +363,16 @@ impl<'gc> MovieLibrary<'gc> {
         }
     }
 
+    fn sound_handles(&self) -> impl Iterator<Item = SoundHandle> + '_ {
+        self.characters.values().filter_map(|character| {
+            if let Character::Sound(sound) = character {
+                Some(*sound)
+            } else {
+                None
+            }
+        })
+    }
+
     /// Returns the `Text` with the given character ID.
     /// Returns `None` if the ID does not exist or is not a `Text`.
     pub fn get_text(&self, id: CharacterId) -> Option<Text<'gc>> {
@@ -466,13 +476,21 @@ impl<'gc> MovieLibraries<'gc> {
             .or_insert_with(|| MovieLibrary::new(&movie))
     }
 
-    fn remove_dead(&mut self, fc: &Finalization<'gc>) -> bool {
+    fn remove_dead(
+        &mut self,
+        fc: &Finalization<'gc>,
+        removed_sounds: &mut Vec<SoundHandle>,
+    ) -> bool {
         let previous_len = self.0.len();
         self.0.retain(|_, library| {
-            library.swf.upgrade().is_some()
+            let is_alive = library.swf.upgrade().is_some()
                 && library
                     .liveness
-                    .is_none_or(|liveness| !liveness.is_dead(fc))
+                    .is_none_or(|liveness| !liveness.is_dead(fc));
+            if !is_alive {
+                removed_sounds.extend(library.sound_handles());
+            }
+            is_alive
         });
         self.0.len() != previous_len
     }
@@ -572,8 +590,12 @@ impl<'gc> Library<'gc> {
         }
     }
 
-    pub(crate) fn remove_dead_movie_libraries(&mut self, fc: &Finalization<'gc>) -> bool {
-        self.movie_libraries.remove_dead(fc)
+    pub(crate) fn remove_dead_movie_libraries(
+        &mut self,
+        fc: &Finalization<'gc>,
+        removed_sounds: &mut Vec<SoundHandle>,
+    ) -> bool {
+        self.movie_libraries.remove_dead(fc, removed_sounds)
     }
 
     /// Returns the default Font implementations behind the built in names (ie `_sans`)
@@ -936,6 +958,7 @@ mod tests {
     use gc_arena::arena::CollectionPhase;
     use gc_arena::lock::GcRefLock;
     use gc_arena::{Arena, Rootable};
+    use slotmap::Key;
 
     #[derive(Collect)]
     #[collect(no_drop)]
@@ -952,11 +975,12 @@ mod tests {
     type TestArena = Arena<Rootable![TestRoot<'_>]>;
 
     fn finish_collection(arena: &mut TestArena) -> bool {
+        let mut removed_sounds = Vec::new();
         let removed = arena.finish_marking().unwrap().finalize(|fc, root| {
             root.0
                 .borrow_mut(fc)
                 .library
-                .remove_dead_movie_libraries(fc)
+                .remove_dead_movie_libraries(fc, &mut removed_sounds)
         });
         arena.finish_cycle();
         removed
@@ -1051,6 +1075,39 @@ mod tests {
         assert_eq!(finish_collections_until_stable(&mut arena), 2);
         assert_eq!(library_count(&arena), 0);
         assert!(weak_movie.upgrade().is_none());
+    }
+
+    #[test]
+    fn removing_movie_library_reports_registered_sounds() {
+        let sound = SoundHandle::null();
+        let movie = Arc::new(SwfMovie::empty(10, None));
+        let mut arena: TestArena = Arena::new(move |mc| {
+            let mut library = Library::empty();
+            library
+                .library_for_movie_mut(movie)
+                .register_character(1, Character::Sound(sound));
+            TestRoot(GcRefLock::new(
+                mc,
+                TestRootData {
+                    library,
+                    liveness: None,
+                    object: None,
+                }
+                .into(),
+            ))
+        });
+        let mut removed_sounds = Vec::new();
+
+        let removed = arena.finish_marking().unwrap().finalize(|fc, root| {
+            root.0
+                .borrow_mut(fc)
+                .library
+                .remove_dead_movie_libraries(fc, &mut removed_sounds)
+        });
+        arena.finish_cycle();
+
+        assert!(removed);
+        assert_eq!(removed_sounds, vec![sound]);
     }
 
     #[test]
