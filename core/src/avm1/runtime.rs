@@ -525,22 +525,17 @@ impl<'gc> Avm1<'gc> {
         // the SWF requests it.
         *context.frame_phase = FramePhase::Idle;
 
+        // Purge clips unloaded by previous frames before running any frames.
+        context.avm1.cleanup_removed_clips(context.gc());
+
         // AVM1 execution order is determined by the global execution list, based on instantiation order.
-        let mut prev: Option<MovieClip<'gc>> = None;
+        // Clips unloaded by this frame's actions stay linked until the post-update
+        // cleanup; they are simply skipped here.
         let mut next = context.avm1.clip_exec_list;
         while let Some(clip) = next {
             next = clip.next_avm1_clip();
-            if clip.avm1_removed() {
-                // Clean up removed clips from this frame or a previous frame.
-                if let Some(prev) = prev {
-                    prev.set_next_avm1_clip(context.gc(), next);
-                } else {
-                    context.avm1.clip_exec_list = next;
-                }
-                clip.set_next_avm1_clip(context.gc(), None);
-            } else {
+            if !clip.avm1_removed() {
                 clip.run_frame_avm1(context);
-                prev = Some(clip);
             }
         }
 
@@ -564,6 +559,30 @@ impl<'gc> Avm1<'gc> {
         if clip.next_avm1_clip().is_none() {
             clip.set_next_avm1_clip(gc_context, self.clip_exec_list);
             self.clip_exec_list = Some(clip);
+        }
+    }
+
+    /// Removes all clips marked `avm1_removed` from the execution list.
+    ///
+    /// This must not be called while the list is being iterated. The list is
+    /// normally cleaned at the start of each frame; it can also be cleaned at
+    /// other times (e.g. before garbage collection) so that unloaded movies
+    /// become unreachable immediately rather than lingering until the next frame.
+    pub fn cleanup_removed_clips(&mut self, mc: &Mutation<'gc>) {
+        let mut prev: Option<MovieClip<'gc>> = None;
+        let mut next = self.clip_exec_list;
+        while let Some(clip) = next {
+            next = clip.next_avm1_clip();
+            if clip.avm1_removed() {
+                if let Some(prev) = prev {
+                    prev.set_next_avm1_clip(mc, next);
+                } else {
+                    self.clip_exec_list = next;
+                }
+                clip.set_next_avm1_clip(mc, None);
+            } else {
+                prev = Some(clip);
+            }
         }
     }
 

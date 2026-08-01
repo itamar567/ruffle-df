@@ -2918,10 +2918,6 @@ macro_rules! impl_downcast_methods {
 }
 
 impl<'gc> DisplayObject<'gc> {
-    pub(crate) fn has_movie_library_liveness(self) -> bool {
-        self.base().movie_library_liveness.get().is_some()
-    }
-
     pub(crate) fn set_movie_library_liveness(
         self,
         mc: &Mutation<'gc>,

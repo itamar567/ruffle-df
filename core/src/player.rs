@@ -287,6 +287,10 @@ impl<'gc> GcRootData<'gc> {
 
 type GcArena = gc_arena::Arena<Rootable![GcRoot<'_>]>;
 
+/// How often (in frames) dead movie libraries are collected when no load/unload
+/// has requested an immediate collection.
+const MOVIE_GC_INTERVAL: u32 = 60;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum RunState {
     Playing,
@@ -319,7 +323,7 @@ pub struct Player {
 
     run_state: RunState,
     needs_render: bool,
-    movie_gc_requested: bool,
+    movie_gc_frames: u32,
 
     renderer: Box<dyn RenderBackend>,
     audio: Box<dyn AudioBackend>,
@@ -2323,7 +2327,6 @@ impl Player {
                 timers,
                 current_context_menu,
                 needs_render: &mut this.needs_render,
-                movie_gc_requested: &mut this.movie_gc_requested,
                 avm1,
                 avm2,
                 external_interface,
@@ -2417,15 +2420,35 @@ impl Player {
             }
         }
 
-        // Removing a library only unroots its already-marked contents, loop until we collect everything
-        while Self::finish_gc_cycle(arena) { }
+        // A cycle that was in progress may have traced the root before the movie
+        // was unloaded, so its marks (and the `is_dead` checks made against them)
+        // are stale; always run a fresh full cycle to observe the current graph.
+        // Afterwards, a removed library's already-marked contents need one more
+        // cycle to be swept, so keep collecting until a cycle removes nothing.
+        while Self::finish_gc_cycle(arena) {}
     }
 
     fn collect_garbage(&mut self) {
-        let movie_gc_requested = std::mem::take(&mut self.movie_gc_requested);
+        // Clips unloaded by this update remain on the AVM1 execution list until the
+        // next frame's cleanup, which would keep their movies' libraries alive for
+        // this collection. Purge them first so that garbage collection observes
+        // unloads immediately.
+        self.enter_arena_mut(|mc, root, _| {
+            root.avm1.cleanup_removed_clips(mc);
+        });
+
         let mut arena = self.gc_arena.borrow_mut();
 
-        if movie_gc_requested {
+        // Collect dead movie libraries periodically rather than only when a movie
+        // is loaded or unloaded: an unload leaves transient references (e.g. the
+        // AVM1 execution list) that are only released after the next frame, so a
+        // collection at the moment of the unload would keep the movie alive
+        // anyway. Running a full collection every `MOVIE_GC_INTERVAL` frames
+        // guarantees that unloaded movies are reclaimed shortly after their last
+        // references disappear, whatever the unload path.
+        self.movie_gc_frames += 1;
+        if self.movie_gc_frames >= MOVIE_GC_INTERVAL {
+            self.movie_gc_frames = 0;
             Self::finish_movie_gc(&mut arena);
             return;
         }
@@ -3130,7 +3153,7 @@ impl PlayerBuilder {
                     RunState::Suspended
                 },
                 needs_render: true,
-                movie_gc_requested: false,
+                movie_gc_frames: 0,
                 self_reference: self_ref.clone(),
                 load_behavior: self.load_behavior,
                 spoofed_url: self.spoofed_url.clone(),
@@ -3340,7 +3363,13 @@ pub enum PlayerMode {
 #[cfg(test)]
 mod tests {
     use super::should_suppress_hover_events;
+    use crate::character::Character;
+    use crate::display_object::{MovieClip, TDisplayObject, TDisplayObjectContainer};
     use crate::events::MouseInputSource;
+    use crate::tag_utils::SwfMovie;
+    use crate::PlayerBuilder;
+    use std::sync::Arc;
+    use super::MOVIE_GC_INTERVAL;
 
     #[test]
     fn touch_suppresses_hover_events_while_pressed() {
@@ -3373,5 +3402,239 @@ mod tests {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn unloaded_movie_is_collected_by_periodic_movie_gc() {
+        let player = PlayerBuilder::new()
+            .with_movie(SwfMovie::empty(8, None))
+            .build();
+        let mut player = player.lock().unwrap();
+
+        let movie = Arc::new(SwfMovie::empty(8, None));
+
+        // Load `movie` into a clip on the root stage, with a timeline child.
+        player.mutate_with_update_context(|context| {
+            let target = MovieClip::new(Arc::new(SwfMovie::empty(8, None)), context.gc());
+            target.replace_with_movie(context, Some(movie.clone()), false, None);
+
+            let child_character =
+                Character::MovieClip(MovieClip::new(movie.clone(), context.gc()));
+            context
+                .library
+                .library_for_movie_mut(movie.clone())
+                .register_character(1, child_character);
+            let child = context
+                .library
+                .library_for_movie(movie.clone())
+                .unwrap()
+                .instantiate_by_id(1, context.gc())
+                .unwrap();
+
+            let root = context.stage.root_clip().unwrap();
+            root.as_container()
+                .unwrap()
+                .insert_at_index(context, target.into(), 0);
+            target
+                .as_container()
+                .unwrap()
+                .insert_at_index(context, child, 0);
+
+            context.avm1.add_to_exec_list(context.gc(), target);
+            context
+                .avm1
+                .add_to_exec_list(context.gc(), child.as_movie_clip().unwrap());
+        });
+
+        // Unload the movie; nothing requests an immediate collection anymore.
+        player.update(|context| {
+            let root = context.stage.root_clip().unwrap();
+            let target = root
+                .as_container()
+                .unwrap()
+                .child_by_index(0)
+                .unwrap()
+                .as_movie_clip()
+                .unwrap();
+            target.avm1_unload_movie(context);
+        });
+
+        // The periodic movie GC must collect the library within a few intervals.
+        let mut frames = 0;
+        let deadline = MOVIE_GC_INTERVAL as usize * 3;
+        loop {
+            let still_present = player.mutate_with_update_context(|context| {
+                context
+                    .library
+                    .known_movies()
+                    .any(|m| Arc::ptr_eq(&m, &movie))
+            });
+            if !still_present {
+                break;
+            }
+            assert!(frames < deadline, "movie library never collected");
+            player.update(|_| {});
+            frames += 1;
+        }
+    }
+
+    #[test]
+    fn loaded_movie_with_child_is_collected_after_unload() {
+        use crate::backend::navigator::{NullExecutor, NullNavigatorBackend};
+        use std::path::Path;
+        use swf::{
+            Compression, FillStyle, Fixed8, Header, PlaceObject, PlaceObjectAction, Rectangle,
+            Shape, ShapeFlag, ShapeRecord, ShapeStyles, Sprite, Tag, Twips,
+        };
+
+        // A target movie with a child MovieClip on its main timeline.
+        let shape = Shape {
+            version: 1,
+            id: 1,
+            shape_bounds: Rectangle {
+                x_min: Twips::from_pixels(0.0),
+                x_max: Twips::from_pixels(10.0),
+                y_min: Twips::from_pixels(0.0),
+                y_max: Twips::from_pixels(10.0),
+            },
+            edge_bounds: Rectangle {
+                x_min: Twips::from_pixels(0.0),
+                x_max: Twips::from_pixels(10.0),
+                y_min: Twips::from_pixels(0.0),
+                y_max: Twips::from_pixels(10.0),
+            },
+            flags: ShapeFlag::empty(),
+            styles: ShapeStyles {
+                fill_styles: vec![FillStyle::Color(swf::Color::from_rgb(0xFF0000, 0xFF))],
+                line_styles: vec![],
+            },
+            shape: vec![ShapeRecord::StyleChange(Box::new(swf::StyleChangeData {
+                    move_to: Some(swf::Point { x: Twips::from_pixels(0.0), y: Twips::from_pixels(0.0) }),
+                    fill_style_0: Some(1),
+                    fill_style_1: None,
+                    line_style: None,
+                    new_styles: None,
+                }))],
+        };
+        let sprite = Sprite {
+            id: 2,
+            num_frames: 1,
+            tags: vec![
+                Tag::PlaceObject(Box::new(PlaceObject {
+                    version: 2,
+                    action: PlaceObjectAction::Place(1),
+                    depth: 1,
+                    matrix: None,
+                    color_transform: None,
+                    ratio: None,
+                    name: None,
+                    clip_depth: None,
+                    class_name: None,
+                    filters: None,
+                    background_color: None,
+                    blend_mode: None,
+                    clip_actions: None,
+                    has_image: false,
+                    is_bitmap_cached: None,
+                    is_visible: None,
+                    amf_data: None,
+                })),
+                Tag::ShowFrame,
+                Tag::End,
+            ],
+        };
+        let header = Header {
+            compression: Compression::None,
+            version: 8,
+            stage_size: Rectangle {
+                x_min: Twips::from_pixels(0.0),
+                x_max: Twips::from_pixels(550.0),
+                y_min: Twips::from_pixels(0.0),
+                y_max: Twips::from_pixels(400.0),
+            },
+            frame_rate: Fixed8::from_f64(30.0),
+            num_frames: 1,
+        };
+        let mut target_swf = Vec::new();
+        swf::write_swf(
+            &header,
+            &[
+                Tag::DefineShape(Box::new(shape)),
+                Tag::DefineSprite(sprite),
+                Tag::PlaceObject(Box::new(PlaceObject {
+                    version: 2,
+                    action: PlaceObjectAction::Place(2),
+                    depth: 1,
+                    matrix: None,
+                    color_transform: None,
+                    ratio: None,
+                    name: Some(swf::SwfStr::from_utf8_str("child")),
+                    clip_depth: None,
+                    class_name: None,
+                    filters: None,
+                    background_color: None,
+                    blend_mode: None,
+                    clip_actions: None,
+                    has_image: false,
+                    is_bitmap_cached: None,
+                    is_visible: None,
+                    amf_data: None,
+                })),
+                Tag::ShowFrame,
+                Tag::End,
+            ],
+            &mut target_swf,
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join("ruffle_movie_gc_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("test.swf"),
+            std::fs::read("../tests/tests/swfs/avm1/unloadmovie/test.swf").unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("target.swf"), &target_swf).unwrap();
+
+        let mut executor = NullExecutor::new();
+        let navigator = NullNavigatorBackend::with_base_path(&dir, &executor).unwrap();
+        let data = std::fs::read(dir.join("test.swf")).unwrap();
+        let movie = SwfMovie::from_data(&data, "file://test.swf".to_string(), None, None).unwrap();
+        let player = PlayerBuilder::new()
+            .with_navigator(navigator)
+            .with_movie(movie)
+            .build();
+
+        let mut run_frame = || {
+            player.lock().unwrap().run_frame();
+            executor.run();
+        };
+        let library_has_target = || {
+            player.lock().unwrap().mutate_with_update_context(|context| {
+                context
+                    .library
+                    .known_movies()
+                    .any(|m| m.url().ends_with("target.swf"))
+            })
+        };
+
+        let mut frames = 0;
+        while frames < 12 && !library_has_target() {
+            run_frame();
+            frames += 1;
+        }
+        assert!(library_has_target(), "target.swf never loaded");
+
+        // Unload happens on frame 2 of test.swf; keep running so the async unload
+        // future is processed, then wait for the periodic movie GC to collect the
+        // library.
+        let deadline = frames + MOVIE_GC_INTERVAL as usize * 3;
+        while frames < deadline && library_has_target() {
+            run_frame();
+            frames += 1;
+        }
+        assert!(
+            !library_has_target(),
+            "target.swf library still present after unload"
+        );
     }
 }

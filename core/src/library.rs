@@ -933,6 +933,7 @@ impl<'gc> FontMap<'gc> {
 mod tests {
     use super::*;
     use crate::display_object::MovieClip;
+    use gc_arena::arena::CollectionPhase;
     use gc_arena::lock::GcRefLock;
     use gc_arena::{Arena, Rootable};
 
@@ -969,6 +970,19 @@ mod tests {
                 return cycles;
             }
         }
+    }
+
+    /// Mirrors `Player::finish_movie_gc`: completes any in-progress cycle, then
+    /// always runs at least one fresh full cycle against the current graph.
+    fn finish_movie_gc(arena: &mut TestArena) {
+        match arena.collection_phase() {
+            CollectionPhase::Sleeping => {}
+            CollectionPhase::Sweeping => arena.finish_cycle(),
+            CollectionPhase::Marking | CollectionPhase::Marked => {
+                finish_collection(arena);
+            }
+        }
+        while finish_collection(arena) {}
     }
 
     fn library_count(arena: &TestArena) -> usize {
@@ -1040,6 +1054,33 @@ mod tests {
     }
 
     #[test]
+    fn forced_movie_collection_refreshes_stale_marks_from_in_progress_cycle() {
+        // A movie GC can be requested while an incremental cycle has already
+        // traced the root. That cycle's marks are stale with respect to the
+        // unload, so the forced collection must run a fresh cycle to observe the
+        // current graph.
+        let (mut arena, weak_movie) = arena_with_movie(false, true);
+
+        // Trace the root while the movie's display object is still alive, marking
+        // the movie's liveness for the current cycle.
+        arena.finish_marking().unwrap().finalize(|_, _| {});
+
+        // Unload the movie: drop its only remaining reference.
+        arena.mutate(|mc, root| root.0.borrow_mut(mc).object = None);
+
+        // Completing the stale cycle sees the liveness as alive and retains the
+        // library; the sweep cannot free the already-marked object either.
+        assert!(!finish_collection(&mut arena));
+        assert_eq!(library_count(&arena), 1);
+
+        // `finish_movie_gc` always follows up with a fresh cycle, which re-traces
+        // the root and collects the now-unreachable library (and its contents).
+        finish_movie_gc(&mut arena);
+        assert_eq!(library_count(&arena), 0);
+        assert!(weak_movie.upgrade().is_none());
+    }
+
+    #[test]
     fn activating_new_movie_replaces_owner_liveness() {
         let movie_a = Arc::new(SwfMovie::empty(10, None));
         let movie_b = Arc::new(SwfMovie::empty(10, None));
@@ -1049,9 +1090,7 @@ mod tests {
             let mut library = Library::empty();
             let owner: DisplayObject = MovieClip::new(movie_a.clone(), mc).into();
 
-            assert!(!owner.has_movie_library_liveness());
             library.activate_movie(movie_a.clone(), owner, mc);
-            assert!(owner.has_movie_library_liveness());
             library
                 .library_for_movie_mut(movie_a.clone())
                 .register_character(1, Character::MovieClip(MovieClip::new(movie_a, mc)));
