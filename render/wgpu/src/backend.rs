@@ -150,11 +150,16 @@ impl WgpuRenderBackend<SwapChainTarget> {
         window: wgpu::SurfaceTargetUnsafe,
         size: (u32, u32),
     ) -> Result<(), Error> {
+        self.suspend_surface();
         let descriptors = &self.descriptors;
         let surface = unsafe { descriptors.wgpu_instance.create_surface_unsafe(window)? };
         self.target =
             SwapChainTarget::new(surface, &descriptors.adapter, size, &descriptors.device);
         Ok(())
+    }
+
+    pub fn suspend_surface(&mut self) {
+        self.target.suspend();
     }
 }
 

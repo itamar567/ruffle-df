@@ -36,7 +36,7 @@ pub trait RenderTarget: Debug + 'static {
 
 #[derive(Debug)]
 pub struct SwapChainTarget {
-    window_surface: wgpu::Surface<'static>,
+    window_surface: Option<wgpu::Surface<'static>>,
     surface_config: wgpu::SurfaceConfiguration,
 }
 
@@ -100,8 +100,16 @@ impl SwapChainTarget {
         surface.configure(device, &surface_config);
         Self {
             surface_config,
-            window_surface: surface,
+            window_surface: Some(surface),
         }
+    }
+
+    pub fn suspend(&mut self) {
+        drop(self.window_surface.take());
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.window_surface.is_none()
     }
 }
 
@@ -111,7 +119,9 @@ impl RenderTarget for SwapChainTarget {
     fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         self.surface_config.width = width;
         self.surface_config.height = height;
-        self.window_surface.configure(device, &self.surface_config);
+        if let Some(surface) = &self.window_surface {
+            surface.configure(device, &self.surface_config);
+        }
     }
 
     fn format(&self) -> wgpu::TextureFormat {
@@ -127,7 +137,11 @@ impl RenderTarget for SwapChainTarget {
     }
 
     fn get_next_texture(&mut self) -> Result<Self::Frame, wgpu::SurfaceError> {
-        let texture = self.window_surface.get_current_texture()?;
+        let surface = self
+            .window_surface
+            .as_ref()
+            .ok_or(wgpu::SurfaceError::Lost)?;
+        let texture = surface.get_current_texture()?;
         let view_format = remove_srgb(self.surface_config.format);
 
         let view = texture.texture.create_view(&wgpu::TextureViewDescriptor {
@@ -325,5 +339,47 @@ impl RenderTarget for TextureTarget {
         } else {
             queue.submit(command_buffers)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RenderTarget, SwapChainTarget};
+
+    fn suspended_target() -> SwapChainTarget {
+        SwapChainTarget {
+            window_surface: None,
+            surface_config: wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                width: 640,
+                height: 480,
+                present_mode: wgpu::PresentMode::Fifo,
+                desired_maximum_frame_latency: 2,
+                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                view_formats: vec![wgpu::TextureFormat::Rgba8Unorm],
+            },
+        }
+    }
+
+    #[test]
+    fn suspended_swap_chain_has_no_frame() {
+        let mut target = suspended_target();
+
+        assert!(target.is_suspended());
+        assert!(matches!(
+            target.get_next_texture(),
+            Err(wgpu::SurfaceError::Lost)
+        ));
+    }
+
+    #[test]
+    fn suspending_swap_chain_is_idempotent() {
+        let mut target = suspended_target();
+
+        target.suspend();
+        target.suspend();
+
+        assert!(target.is_suspended());
     }
 }
