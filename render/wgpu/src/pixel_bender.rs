@@ -487,6 +487,7 @@ pub(super) fn run_pixelbender_shader_impl(
                             bind_linear: Default::default(),
                             bind_nearest: Default::default(),
                             copy_count: Cell::new(0),
+                            generation: Cell::new(0),
                         }))
                     });
                     *texture = Some(cached_fresh_handle.clone().into());

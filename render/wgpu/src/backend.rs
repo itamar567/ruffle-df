@@ -281,7 +281,15 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             ));
         }
 
+        let mut bounds = None::<[f32; 4]>;
         for draw in lyon_mesh.draws {
+            for vertex in &draw.vertices {
+                let current = bounds.get_or_insert([vertex.x, vertex.y, vertex.x, vertex.y]);
+                current[0] = current[0].min(vertex.x);
+                current[1] = current[1].min(vertex.y);
+                current[2] = current[2].max(vertex.x);
+                current[3] = current[3].max(vertex.y);
+            }
             let draw_id = draws.len();
             if let Some(draw) = PendingDraw::new(
                 self,
@@ -322,6 +330,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             draws,
             vertex_buffer,
             index_buffer,
+            bounds,
         }
     }
 
@@ -608,27 +617,29 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     &mut self.active_frame.command_encoder,
                 );
             }
+            texture
+                .generation
+                .set(texture.generation.get().wrapping_add(1));
             // Periodically flush GPU work to prevent OOM when many cache entries
             // accumulate (e.g. when a large container's cacheAsBitmap is skipped
             // but its hundreds of children each have their own bitmap caches).
             self.active_frame.maybe_flush(&self.descriptors);
         }
 
-        self.surface.draw_commands_and_copy_to(
+        self.surface.draw_frame_commands_and_copy_to(
             frame_output.view(),
-            RenderTargetMode::FreshWithColor(wgpu::Color {
+            wgpu::Color {
                 r: f64::from(clear.r) / 255.0,
                 g: f64::from(clear.g) / 255.0,
                 b: f64::from(clear.b) / 255.0,
                 a: f64::from(clear.a) / 255.0,
-            }),
+            },
             &self.descriptors,
             &mut self.active_frame.staging_belt,
             &self.dynamic_transforms,
             &mut self.active_frame.command_encoder,
             &self.meshes,
             commands,
-            LayerRef::None,
             &mut self.texture_pool,
         );
         self.active_frame.staging_belt.finish();
@@ -689,6 +700,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             bind_linear: Default::default(),
             bind_nearest: Default::default(),
             copy_count: Cell::new(0),
+            generation: Cell::new(0),
         }));
 
         Ok(handle)
@@ -743,6 +755,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             },
             extent,
         );
+        texture
+            .generation
+            .set(texture.generation.get().wrapping_add(1));
 
         Ok(())
     }
@@ -793,6 +808,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             LayerRef::Current,
             &mut self.offscreen_texture_pool,
         );
+        texture
+            .generation
+            .set(texture.generation.get().wrapping_add(1));
 
         self.active_frame.maybe_flush(&self.descriptors);
         Some(self.make_queue_sync_handle(target, None, handle, bounds))
@@ -903,6 +921,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 depth_or_array_layers: 1,
             },
         );
+        dest_texture
+            .generation
+            .set(dest_texture.generation.get().wrapping_add(1));
 
         self.active_frame.maybe_flush(&self.descriptors);
         Some(self.make_queue_sync_handle(target, None, destination, copy_area))
@@ -963,6 +984,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     bind_linear: Default::default(),
                     bind_nearest: Default::default(),
                     copy_count: Cell::new(0),
+                    generation: Cell::new(0),
                 }))
             }
         };
@@ -1023,6 +1045,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             // When running a standalone shader, we always process the entire image
             &FilterSource::for_entire_texture(&target_texture.texture),
         )?;
+        target_texture
+            .generation
+            .set(target_texture.generation.get().wrapping_add(1));
 
         let index = Some(self.active_frame.submit_for_target(
             &self.descriptors,
@@ -1121,6 +1146,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             bind_linear: Default::default(),
             bind_nearest: Default::default(),
             copy_count: Cell::new(0),
+            generation: Cell::new(0),
         })))
     }
 
@@ -1218,6 +1244,13 @@ pub enum RenderTargetMode {
     FreshWithTexture(wgpu::Texture),
     // Use the provided texture as our frame buffer, and clear it with the given color.
     ExistingWithColor(wgpu::Texture, wgpu::Color),
+    // Reuse retained multisampled and resolved main-frame textures. A color clears the first
+    // render pass for a full redraw; None preserves samples for dirty-tile rendering.
+    RetainedMultisample {
+        multisampled: wgpu::Texture,
+        resolved: wgpu::Texture,
+        clear: Option<wgpu::Color>,
+    },
 }
 
 impl RenderTargetMode {
@@ -1226,6 +1259,7 @@ impl RenderTargetMode {
             RenderTargetMode::FreshWithColor(color) => Some(*color),
             RenderTargetMode::FreshWithTexture(_) => None,
             RenderTargetMode::ExistingWithColor(_, color) => Some(*color),
+            RenderTargetMode::RetainedMultisample { clear, .. } => *clear,
         }
     }
 }

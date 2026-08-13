@@ -21,6 +21,7 @@ pub struct Mesh {
     pub draws: Vec<Draw>,
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
+    pub bounds: Option<[f32; 4]>,
 }
 
 impl ShapeHandleImpl for Mesh {}
@@ -128,7 +129,7 @@ pub enum PendingDrawType {
     },
     Bitmap {
         texture_transforms_index: wgpu::BufferAddress,
-        texture_view: wgpu::TextureView,
+        bitmap: ruffle_render::bitmap::BitmapHandle,
         is_repeating: bool,
         is_smoothed: bool,
         bind_group_label: Option<String>,
@@ -180,15 +181,13 @@ impl PendingDrawType {
         uniform_buffers: &mut BufferBuilder,
     ) -> Option<Self> {
         let handle = source.bitmap_handle(bitmap.bitmap_id, backend)?;
-        let texture = as_texture(&handle);
-        let texture_view = texture.texture.create_view(&Default::default());
         let texture_transforms_index = create_texture_transforms(&bitmap.matrix, uniform_buffers);
         let bind_group_label =
             create_debug_label!("Shape {} (bitmap) draw {} bindgroup", shape_id, draw_id);
 
         Some(PendingDrawType::Bitmap {
             texture_transforms_index,
-            texture_view,
+            bitmap: handle,
             is_repeating: bitmap.is_repeating,
             is_smoothed: bitmap.is_smoothed,
             bind_group_label,
@@ -251,11 +250,12 @@ impl PendingDrawType {
             }
             PendingDrawType::Bitmap {
                 texture_transforms_index,
-                texture_view,
+                bitmap,
                 is_repeating,
                 is_smoothed,
                 bind_group_label,
             } => {
+                let texture_view = as_texture(&bitmap).texture.create_view(&Default::default());
                 let binds = BitmapBinds::new(
                     &descriptors.device,
                     &descriptors.bind_layouts.bitmap,
@@ -268,7 +268,7 @@ impl PendingDrawType {
                     bind_group_label,
                 );
 
-                DrawType::Bitmap { binds }
+                DrawType::Bitmap { binds, bitmap }
             }
         }
     }
@@ -277,8 +277,13 @@ impl PendingDrawType {
 #[derive(Debug)]
 pub enum DrawType {
     Color,
-    Gradient { bind_group: wgpu::BindGroup },
-    Bitmap { binds: BitmapBinds },
+    Gradient {
+        bind_group: wgpu::BindGroup,
+    },
+    Bitmap {
+        binds: BitmapBinds,
+        bitmap: ruffle_render::bitmap::BitmapHandle,
+    },
 }
 
 #[derive(Debug)]

@@ -1,3 +1,4 @@
+use crate::Pipelines;
 use crate::Transforms;
 use crate::backend::RenderTargetMode;
 use crate::buffer_pool::{AlwaysCompatible, PoolEntry, TexturePool};
@@ -256,33 +257,43 @@ impl CommandTarget {
 
         let whole_frame_bind_group = OnceCell::new();
 
-        let (frame_buffer, resolve_buffer) =
-            if let RenderTargetMode::ExistingWithColor(texture, _) = &render_target_mode {
-                if sample_count > 1 {
-                    (
-                        make_pooled_frame_buffer(),
-                        Some(ResolveBuffer::new_manual(texture.clone())),
-                    )
-                } else {
-                    (FrameBuffer::new_manual(texture.clone()), None)
-                }
-            } else if sample_count > 1 {
+        let (frame_buffer, resolve_buffer) = if let RenderTargetMode::RetainedMultisample {
+            multisampled,
+            resolved,
+            ..
+        } = &render_target_mode
+        {
+            debug_assert!(sample_count > 1);
+            (
+                FrameBuffer::new_manual(multisampled.clone()),
+                Some(ResolveBuffer::new_manual(resolved.clone())),
+            )
+        } else if let RenderTargetMode::ExistingWithColor(texture, _) = &render_target_mode {
+            if sample_count > 1 {
                 (
                     make_pooled_frame_buffer(),
-                    Some(ResolveBuffer::new(
-                        descriptors,
-                        size,
-                        format,
-                        wgpu::TextureUsages::COPY_SRC
-                            | wgpu::TextureUsages::COPY_DST
-                            | wgpu::TextureUsages::TEXTURE_BINDING
-                            | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                        pool,
-                    )),
+                    Some(ResolveBuffer::new_manual(texture.clone())),
                 )
             } else {
-                (make_pooled_frame_buffer(), None)
-            };
+                (FrameBuffer::new_manual(texture.clone()), None)
+            }
+        } else if sample_count > 1 {
+            (
+                make_pooled_frame_buffer(),
+                Some(ResolveBuffer::new(
+                    descriptors,
+                    size,
+                    format,
+                    wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::COPY_DST
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    pool,
+                )),
+            )
+        } else {
+            (make_pooled_frame_buffer(), None)
+        };
 
         if let RenderTargetMode::FreshWithTexture(texture) = &render_target_mode {
             if let Some(resolve_buffer) = &resolve_buffer {
@@ -365,6 +376,38 @@ impl CommandTarget {
                 color_attachments: &[self.color_attachments()],
                 ..Default::default()
             });
+        }
+    }
+
+    pub fn prepare_dirty_tiles(
+        &self,
+        rects: &[PixelRegion],
+        clear: wgpu::Color,
+        pipelines: &Pipelines,
+        descriptors: &Descriptors,
+        pool: &mut TexturePool,
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        let (_buffer, clear_bind_group) =
+            create_region_bind_group_with_color(descriptors, self.viewport, clear);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: create_debug_label!("Mark and clear dirty tiles").as_deref(),
+            color_attachments: &[self.color_attachments()],
+            depth_stencil_attachment: self.stencil_attachment(descriptors, pool),
+            ..Default::default()
+        });
+        pass.set_bind_group(0, self.globals().bind_group(), &[]);
+        pass.set_bind_group(1, &clear_bind_group, &[0]);
+        pass.set_stencil_reference(0x80);
+        pass.set_vertex_buffer(0, descriptors.quad.vertices_pos_color.slice(..));
+        pass.set_index_buffer(
+            descriptors.quad.indices.slice(..),
+            wgpu::IndexFormat::Uint32,
+        );
+        pass.set_pipeline(&pipelines.dirty_tile_stencil);
+        for rect in rects {
+            pass.set_scissor_rect(rect.x_min, rect.y_min, rect.width(), rect.height());
+            pass.draw_indexed(0..6, 0, 0..1);
         }
     }
 
@@ -505,6 +548,14 @@ pub fn create_region_bind_group(
     descriptors: &Descriptors,
     viewport: PixelRegion,
 ) -> (wgpu::Buffer, wgpu::BindGroup) {
+    create_region_bind_group_with_color(descriptors, viewport, wgpu::Color::TRANSPARENT)
+}
+
+fn create_region_bind_group_with_color(
+    descriptors: &Descriptors,
+    viewport: PixelRegion,
+    color: wgpu::Color,
+) -> (wgpu::Buffer, wgpu::BindGroup) {
     let transform = Transforms {
         world_matrix: [
             [viewport.width() as f32, 0.0, 0.0, 0.0],
@@ -513,7 +564,12 @@ pub fn create_region_bind_group(
             [viewport.x_min as f32, viewport.y_min as f32, 0.0, 1.0],
         ],
         mult_color: [1.0, 1.0, 1.0, 1.0],
-        add_color: [0.0, 0.0, 0.0, 0.0],
+        add_color: [
+            color.r as f32,
+            color.g as f32,
+            color.b as f32,
+            color.a as f32,
+        ],
     };
     let transforms_buffer = create_buffer_with_data(
         &descriptors.device,

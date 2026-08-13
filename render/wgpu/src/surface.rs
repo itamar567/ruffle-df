@@ -1,4 +1,5 @@
 mod commands;
+mod dirty;
 pub mod target;
 
 use crate::backend::RenderTargetMode;
@@ -15,6 +16,7 @@ use ruffle_render::bitmap::PixelRegion;
 use ruffle_render::commands::CommandList;
 use ruffle_render::pixel_bender_support::{ImageInputTexture, PixelBenderShaderArgument};
 use ruffle_render::quality::StageQuality;
+use std::cell::RefCell;
 use std::sync::Arc;
 use target::{CommandTarget, create_region_bind_group};
 use tracing::instrument;
@@ -33,6 +35,7 @@ pub struct Surface {
     sample_count: u32,
     pipelines: Arc<Pipelines>,
     format: wgpu::TextureFormat,
+    dirty_tiles: RefCell<dirty::DirtyTileState>,
 }
 
 impl Surface {
@@ -76,7 +79,91 @@ impl Surface {
             sample_count,
             pipelines,
             format: frame_buffer_format,
+            dirty_tiles: RefCell::new(dirty::DirtyTileState::new()),
         }
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub fn draw_frame_commands_and_copy_to<'frame, 'global: 'frame>(
+        &self,
+        frame_view: &wgpu::TextureView,
+        clear: wgpu::Color,
+        descriptors: &'global Descriptors,
+        staging_belt: &'frame mut wgpu::util::StagingBelt,
+        dynamic_transforms: &'global DynamicTransforms,
+        draw_encoder: &'frame mut wgpu::CommandEncoder,
+        meshes: &'global Vec<Mesh>,
+        commands: CommandList,
+        texture_pool: &mut TexturePool,
+    ) {
+        if self.sample_count == 1 {
+            return self.draw_commands_and_copy_to(
+                frame_view,
+                RenderTargetMode::FreshWithColor(clear),
+                descriptors,
+                staging_belt,
+                dynamic_transforms,
+                draw_encoder,
+                meshes,
+                commands,
+                LayerRef::None,
+                texture_pool,
+            );
+        }
+
+        let decision = self.dirty_tiles.borrow_mut().prepare(
+            descriptors,
+            &commands,
+            self.viewport,
+            self.format,
+            self.sample_count,
+            clear,
+        );
+        if decision.rects.as_ref().is_some_and(Vec::is_empty) {
+            let globals = texture_pool.get_globals(descriptors, self.viewport);
+            let (_buffer, bind_group) = create_region_bind_group(descriptors, self.viewport);
+            let view = decision.resolved.create_view(&Default::default());
+            run_copy_pipeline(
+                descriptors,
+                self.format,
+                frame_view,
+                &view,
+                &bind_group,
+                &globals,
+                1,
+                draw_encoder,
+            );
+            return;
+        }
+
+        let partial = decision.rects.is_some();
+        let target = self.draw_commands_impl(
+            RenderTargetMode::RetainedMultisample {
+                multisampled: decision.multisampled,
+                resolved: decision.resolved,
+                clear: (!partial).then_some(clear),
+            },
+            descriptors,
+            meshes,
+            commands,
+            staging_belt,
+            dynamic_transforms,
+            draw_encoder,
+            LayerRef::None,
+            texture_pool,
+            decision.rects.as_deref(),
+            clear,
+        );
+        run_copy_pipeline(
+            descriptors,
+            self.format,
+            frame_view,
+            target.color_view(),
+            target.whole_frame_bind_group(descriptors),
+            target.globals(),
+            1,
+            draw_encoder,
+        );
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -132,6 +219,36 @@ impl Surface {
         nearest_layer: LayerRef<'frame>,
         texture_pool: &mut TexturePool,
     ) -> CommandTarget {
+        self.draw_commands_impl(
+            render_target_mode,
+            descriptors,
+            meshes,
+            commands,
+            staging_belt,
+            dynamic_transforms,
+            draw_encoder,
+            nearest_layer,
+            texture_pool,
+            None,
+            wgpu::Color::TRANSPARENT,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn draw_commands_impl<'frame, 'global: 'frame>(
+        &self,
+        render_target_mode: RenderTargetMode,
+        descriptors: &'global Descriptors,
+        meshes: &'global Vec<Mesh>,
+        commands: CommandList,
+        staging_belt: &'global mut wgpu::util::StagingBelt,
+        dynamic_transforms: &'global DynamicTransforms,
+        draw_encoder: &'frame mut wgpu::CommandEncoder,
+        nearest_layer: LayerRef<'frame>,
+        texture_pool: &mut TexturePool,
+        dirty_rects: Option<&[PixelRegion]>,
+        clear: wgpu::Color,
+    ) -> CommandTarget {
         let target = CommandTarget::for_viewport(
             descriptors,
             texture_pool,
@@ -141,6 +258,16 @@ impl Surface {
             render_target_mode,
             draw_encoder,
         );
+        if let Some(rects) = dirty_rects {
+            target.prepare_dirty_tiles(
+                rects,
+                clear,
+                &self.pipelines,
+                descriptors,
+                texture_pool,
+                draw_encoder,
+            );
+        }
 
         let mut num_masks = 0;
         let mut mask_state = MaskState::NoMask;
@@ -173,11 +300,13 @@ impl Surface {
                         draw_encoder,
                         &dynamic_transforms.buffer,
                     );
+                    let dirty_tiles = dirty_rects.is_some();
+                    let effective_needs_stencil = needs_stencil || dirty_tiles;
                     let mut render_pass =
                         draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: create_debug_label!(
                                 "Chunked draw calls {}",
-                                if needs_stencil {
+                                if effective_needs_stencil {
                                     "(with stencil)"
                                 } else {
                                     "(Stencilless)"
@@ -185,7 +314,7 @@ impl Surface {
                             )
                             .as_deref(),
                             color_attachments: &[target.color_attachments()],
-                            depth_stencil_attachment: if needs_stencil {
+                            depth_stencil_attachment: if effective_needs_stencil {
                                 target.stencil_attachment(descriptors, texture_pool)
                             } else {
                                 None
@@ -200,7 +329,8 @@ impl Surface {
                         render_pass,
                         num_masks,
                         mask_state,
-                        needs_stencil,
+                        effective_needs_stencil,
+                        dirty_tiles,
                     );
 
                     for command in &chunk {
@@ -257,6 +387,8 @@ impl Surface {
                     needs_stencil,
                     viewport,
                 } => {
+                    let dirty_tiles = dirty_rects.is_some();
+                    let effective_needs_stencil = needs_stencil || dirty_tiles;
                     let parent = match blend_mode {
                         ComplexBlend::Alpha | ComplexBlend::Erase => {
                             match nearest_layer {
@@ -285,7 +417,7 @@ impl Surface {
                                 label: create_debug_label!(
                                     "Complex blend binds {:?} {}",
                                     blend_mode,
-                                    if needs_stencil {
+                                    if effective_needs_stencil {
                                         "(with stencil)"
                                     } else {
                                         "(Stencilless)"
@@ -322,7 +454,7 @@ impl Surface {
                             label: create_debug_label!(
                                 "Complex blend {:?} {}",
                                 blend_mode,
-                                if needs_stencil {
+                                if effective_needs_stencil {
                                     "(with stencil)"
                                 } else {
                                     "(Stencilless)"
@@ -330,7 +462,7 @@ impl Surface {
                             )
                             .as_deref(),
                             color_attachments: &[target.color_attachments()],
-                            depth_stencil_attachment: if needs_stencil {
+                            depth_stencil_attachment: if effective_needs_stencil {
                                 target.stencil_attachment(descriptors, texture_pool)
                             } else {
                                 None
@@ -339,7 +471,18 @@ impl Surface {
                         });
                     render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
 
-                    if needs_stencil {
+                    if dirty_tiles {
+                        let reference = match mask_state {
+                            MaskState::NoMask => num_masks,
+                            MaskState::DrawMaskStencil => num_masks - 1,
+                            MaskState::DrawMaskedContent | MaskState::ClearMaskStencil => num_masks,
+                        };
+                        render_pass.set_stencil_reference(0x80 | reference);
+                        render_pass.set_pipeline(
+                            self.pipelines.complex_blends[blend_mode]
+                                .dirty_pipeline_for(mask_state),
+                        );
+                    } else if needs_stencil {
                         match mask_state {
                             MaskState::NoMask => {}
                             MaskState::DrawMaskStencil => {

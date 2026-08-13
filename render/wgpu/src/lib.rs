@@ -250,6 +250,7 @@ pub struct Texture {
     bind_linear: OnceCell<BitmapBinds>,
     bind_nearest: OnceCell<BitmapBinds>,
     copy_count: Cell<u8>,
+    pub(crate) generation: Cell<u64>,
 }
 
 impl Texture {

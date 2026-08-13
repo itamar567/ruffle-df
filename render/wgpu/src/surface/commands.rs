@@ -30,9 +30,11 @@ pub struct CommandRenderer<'pass, 'frame: 'pass, 'global: 'frame> {
     render_pass: wgpu::RenderPass<'pass>,
     needs_stencil: bool,
     dynamic_transforms: &'global DynamicTransforms,
+    dirty_tiles: bool,
 }
 
 impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'global> {
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         pipelines: &'frame Pipelines,
         descriptors: &'global Descriptors,
@@ -41,7 +43,12 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
         num_masks: u32,
         mask_state: MaskState,
         needs_stencil: bool,
+        dirty_tiles: bool,
     ) -> Self {
+        let mut render_pass = render_pass;
+        if dirty_tiles {
+            render_pass.set_stencil_reference(0x80 | num_masks);
+        }
         Self {
             pipelines,
             num_masks,
@@ -50,6 +57,7 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
             descriptors,
             needs_stencil,
             dynamic_transforms,
+            dirty_tiles,
         }
     }
 
@@ -58,13 +66,13 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
             match self.mask_state {
                 MaskState::NoMask => {}
                 MaskState::DrawMaskStencil => {
-                    self.render_pass.set_stencil_reference(self.num_masks - 1);
+                    self.set_stencil_reference(self.num_masks - 1);
                 }
                 MaskState::DrawMaskedContent => {
-                    self.render_pass.set_stencil_reference(self.num_masks);
+                    self.set_stencil_reference(self.num_masks);
                 }
                 MaskState::ClearMaskStencil => {
-                    self.render_pass.set_stencil_reference(self.num_masks);
+                    self.set_stencil_reference(self.num_masks);
                 }
             }
         }
@@ -114,7 +122,10 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
     }
 
     pub fn prep_color(&mut self) {
-        if self.needs_stencil {
+        if self.dirty_tiles {
+            self.render_pass
+                .set_pipeline(self.pipelines.color.dirty_pipeline_for(self.mask_state));
+        } else if self.needs_stencil {
             self.render_pass
                 .set_pipeline(self.pipelines.color.pipeline_for(self.mask_state));
         } else {
@@ -124,7 +135,10 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
     }
 
     pub fn prep_lines(&mut self) {
-        if self.needs_stencil {
+        if self.dirty_tiles {
+            self.render_pass
+                .set_pipeline(self.pipelines.lines.dirty_pipeline_for(self.mask_state));
+        } else if self.needs_stencil {
             self.render_pass
                 .set_pipeline(self.pipelines.lines.pipeline_for(self.mask_state));
         } else {
@@ -134,7 +148,10 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
     }
 
     pub fn prep_gradient(&mut self, bind_group: &'pass wgpu::BindGroup) {
-        if self.needs_stencil {
+        if self.dirty_tiles {
+            self.render_pass
+                .set_pipeline(self.pipelines.gradients.dirty_pipeline_for(self.mask_state));
+        } else if self.needs_stencil {
             self.render_pass
                 .set_pipeline(self.pipelines.gradients.pipeline_for(self.mask_state));
         } else {
@@ -151,21 +168,28 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
         blend_mode: TrivialBlend,
         render_stage3d: bool,
     ) {
-        match (self.needs_stencil, render_stage3d) {
-            (true, true) => {
-                self.render_pass
-                    .set_pipeline(&self.pipelines.bitmap_opaque_dummy_stencil);
-            }
-            (true, false) => {
-                self.render_pass
-                    .set_pipeline(self.pipelines.bitmap[blend_mode].pipeline_for(self.mask_state));
-            }
-            (false, true) => {
-                self.render_pass.set_pipeline(&self.pipelines.bitmap_opaque);
-            }
-            (false, false) => {
-                self.render_pass
-                    .set_pipeline(self.pipelines.bitmap[blend_mode].stencilless_pipeline());
+        if self.dirty_tiles && !render_stage3d {
+            self.render_pass.set_pipeline(
+                self.pipelines.bitmap[blend_mode].dirty_pipeline_for(self.mask_state),
+            );
+        } else {
+            match (self.needs_stencil, render_stage3d) {
+                (true, true) => {
+                    self.render_pass
+                        .set_pipeline(&self.pipelines.bitmap_opaque_dummy_stencil);
+                }
+                (true, false) => {
+                    self.render_pass.set_pipeline(
+                        self.pipelines.bitmap[blend_mode].pipeline_for(self.mask_state),
+                    );
+                }
+                (false, true) => {
+                    self.render_pass.set_pipeline(&self.pipelines.bitmap_opaque);
+                }
+                (false, false) => {
+                    self.render_pass
+                        .set_pipeline(self.pipelines.bitmap[blend_mode].stencilless_pipeline());
+                }
             }
         }
 
@@ -173,7 +197,13 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
     }
 
     pub fn prep_alpha_mask(&mut self, bind_group: &'pass wgpu::BindGroup) {
-        if self.needs_stencil {
+        if self.dirty_tiles {
+            self.render_pass.set_pipeline(
+                self.pipelines
+                    .alpha_mask
+                    .dirty_pipeline_for(self.mask_state),
+            );
+        } else if self.needs_stencil {
             self.render_pass
                 .set_pipeline(self.pipelines.alpha_mask.pipeline_for(self.mask_state));
         } else {
@@ -399,25 +429,25 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
         );
         self.num_masks += 1;
         self.mask_state = MaskState::DrawMaskStencil;
-        self.render_pass.set_stencil_reference(self.num_masks - 1);
+        self.set_stencil_reference(self.num_masks - 1);
     }
 
     pub fn activate_mask(&mut self) {
         debug_assert!(self.num_masks > 0 && self.mask_state == MaskState::DrawMaskStencil);
         self.mask_state = MaskState::DrawMaskedContent;
-        self.render_pass.set_stencil_reference(self.num_masks);
+        self.set_stencil_reference(self.num_masks);
     }
 
     pub fn deactivate_mask(&mut self) {
         debug_assert!(self.num_masks > 0 && self.mask_state == MaskState::DrawMaskedContent);
         self.mask_state = MaskState::ClearMaskStencil;
-        self.render_pass.set_stencil_reference(self.num_masks);
+        self.set_stencil_reference(self.num_masks);
     }
 
     pub fn pop_mask(&mut self) {
         debug_assert!(self.num_masks > 0 && self.mask_state == MaskState::ClearMaskStencil);
         self.num_masks -= 1;
-        self.render_pass.set_stencil_reference(self.num_masks);
+        self.set_stencil_reference(self.num_masks);
         if self.num_masks == 0 {
             self.mask_state = MaskState::NoMask;
         } else {
@@ -431,6 +461,11 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
 
     pub fn mask_state(&self) -> MaskState {
         self.mask_state
+    }
+
+    fn set_stencil_reference(&mut self, reference: u32) {
+        self.render_pass
+            .set_stencil_reference(reference | if self.dirty_tiles { 0x80 } else { 0 });
     }
 }
 

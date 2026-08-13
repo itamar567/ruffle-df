@@ -27,6 +27,7 @@ pub const VERTEX_BUFFERS_DESCRIPTION_COLOR: [wgpu::VertexBufferLayout; 1] =
 #[derive(Debug)]
 pub struct ShapePipeline {
     pub pipelines: EnumMap<MaskState, wgpu::RenderPipeline>,
+    dirty_pipelines: EnumMap<MaskState, wgpu::RenderPipeline>,
     stencilless: wgpu::RenderPipeline,
 }
 
@@ -47,6 +48,7 @@ pub struct Pipelines {
     pub gradients: ShapePipeline,
     pub complex_blends: EnumMap<ComplexBlend, ShapePipeline>,
     pub alpha_mask: ShapePipeline,
+    pub dirty_tile_stencil: wgpu::RenderPipeline,
 }
 
 impl ShapePipeline {
@@ -58,15 +60,21 @@ impl ShapePipeline {
         &self.stencilless
     }
 
+    pub fn dirty_pipeline_for(&self, mask_state: MaskState) -> &wgpu::RenderPipeline {
+        &self.dirty_pipelines[mask_state]
+    }
+
     /// Builds of a nested `EnumMap` that maps a `MaskState` to
     /// a `RenderPipeline`. The provided callback is used to construct the `RenderPipeline`
     /// for each possible `MaskState`.
     fn build(
         stencilless: wgpu::RenderPipeline,
         f: impl FnMut(MaskState) -> wgpu::RenderPipeline,
+        dirty_f: impl FnMut(MaskState) -> wgpu::RenderPipeline,
     ) -> Self {
         ShapePipeline {
             pipelines: EnumMap::from_fn(f),
+            dirty_pipelines: EnumMap::from_fn(dirty_f),
             stencilless,
         }
     }
@@ -93,6 +101,71 @@ impl Pipelines {
             BlendState::PREMULTIPLIED_ALPHA_BLENDING,
             &[],
             PrimitiveTopology::TriangleList,
+        );
+
+        let dirty_tile_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: create_debug_label!("Dirty tile pipeline layout").as_deref(),
+            bind_group_layouts: &colort_bindings,
+            push_constant_ranges: &[],
+        });
+        let dirty_tile_pipeline =
+            |name: &str,
+             pass_op: wgpu::StencilOperation,
+             read_mask: u32,
+             write_mask: u32,
+             color_writes: wgpu::ColorWrites| {
+                device.create_render_pipeline(&create_pipeline_descriptor(
+                    create_debug_label!("{name}").as_deref(),
+                    &shaders.dirty_tile_shader,
+                    &shaders.dirty_tile_shader,
+                    &dirty_tile_layout,
+                    Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Stencil8,
+                        depth_write_enabled: false,
+                        depth_compare: wgpu::CompareFunction::Always,
+                        stencil: wgpu::StencilState {
+                            front: wgpu::StencilFaceState {
+                                compare: if read_mask == 0 {
+                                    wgpu::CompareFunction::Always
+                                } else {
+                                    wgpu::CompareFunction::Equal
+                                },
+                                fail_op: wgpu::StencilOperation::Keep,
+                                depth_fail_op: wgpu::StencilOperation::Keep,
+                                pass_op,
+                            },
+                            back: wgpu::StencilFaceState {
+                                compare: if read_mask == 0 {
+                                    wgpu::CompareFunction::Always
+                                } else {
+                                    wgpu::CompareFunction::Equal
+                                },
+                                fail_op: wgpu::StencilOperation::Keep,
+                                depth_fail_op: wgpu::StencilOperation::Keep,
+                                pass_op,
+                            },
+                            read_mask,
+                            write_mask,
+                        },
+                        bias: Default::default(),
+                    }),
+                    &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(BlendState::REPLACE),
+                        write_mask: color_writes,
+                    })],
+                    &VERTEX_BUFFERS_DESCRIPTION_COLOR,
+                    msaa_sample_count,
+                    &[],
+                    PrimitiveTopology::TriangleList,
+                ))
+            };
+        let dirty_tile_stencil = dirty_tile_pipeline(
+            "Dirty tile mark and clear",
+            wgpu::StencilOperation::Replace,
+            0,
+            0x80,
+            wgpu::ColorWrites::ALL,
         );
 
         let lines_pipelines = create_shape_pipeline(
@@ -251,6 +324,7 @@ impl Pipelines {
             gradients: gradient_pipeline,
             complex_blends: complex_blend_pipelines,
             alpha_mask: alpha_mask_pipeline,
+            dirty_tile_stencil,
         }
     }
 }
@@ -356,6 +430,36 @@ fn create_shape_pipeline(
         ))
     };
 
+    let dirty_mask_render_state = |mask_name, stencil_state, write_mask| {
+        device.create_render_pipeline(&create_pipeline_descriptor(
+            create_debug_label!("{} dirty-tile pipeline {}", name, mask_name).as_deref(),
+            shader,
+            shader,
+            &pipeline_layout,
+            Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Stencil8,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState {
+                    front: stencil_state,
+                    back: stencil_state,
+                    read_mask: !0,
+                    write_mask: 0x7f,
+                },
+                bias: Default::default(),
+            }),
+            &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(blend),
+                write_mask,
+            })],
+            vertex_buffers_layout,
+            msaa_sample_count,
+            &[],
+            primitive_topology,
+        ))
+    };
+
     ShapePipeline::build(
         device.create_render_pipeline(&create_pipeline_descriptor(
             create_debug_label!("{} stencilless pipeline", name).as_deref(),
@@ -405,6 +509,48 @@ fn create_shape_pipeline(
                 wgpu::ColorWrites::ALL,
             ),
             MaskState::ClearMaskStencil => mask_render_state(
+                "clear mask stencil",
+                wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Equal,
+                    fail_op: wgpu::StencilOperation::Keep,
+                    depth_fail_op: wgpu::StencilOperation::Keep,
+                    pass_op: wgpu::StencilOperation::DecrementClamp,
+                },
+                wgpu::ColorWrites::empty(),
+            ),
+        },
+        |mask_state| match mask_state {
+            MaskState::NoMask => dirty_mask_render_state(
+                "no mask",
+                wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Equal,
+                    fail_op: wgpu::StencilOperation::Keep,
+                    depth_fail_op: wgpu::StencilOperation::Keep,
+                    pass_op: wgpu::StencilOperation::Keep,
+                },
+                wgpu::ColorWrites::ALL,
+            ),
+            MaskState::DrawMaskStencil => dirty_mask_render_state(
+                "draw mask stencil",
+                wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Equal,
+                    fail_op: wgpu::StencilOperation::Keep,
+                    depth_fail_op: wgpu::StencilOperation::Keep,
+                    pass_op: wgpu::StencilOperation::IncrementClamp,
+                },
+                wgpu::ColorWrites::empty(),
+            ),
+            MaskState::DrawMaskedContent => dirty_mask_render_state(
+                "draw masked content",
+                wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Equal,
+                    fail_op: wgpu::StencilOperation::Keep,
+                    depth_fail_op: wgpu::StencilOperation::Keep,
+                    pass_op: wgpu::StencilOperation::Keep,
+                },
+                wgpu::ColorWrites::ALL,
+            ),
+            MaskState::ClearMaskStencil => dirty_mask_render_state(
                 "clear mask stencil",
                 wgpu::StencilFaceState {
                     compare: wgpu::CompareFunction::Equal,
