@@ -548,6 +548,7 @@ pub fn chunk_blends<'a>(
     meshes: &'a Vec<Mesh>,
     quality: StageQuality,
     viewport: PixelRegion,
+    dirty_rects: Option<&[PixelRegion]>,
     nearest_layer: LayerRef,
     texture_pool: &mut TexturePool,
 ) -> Vec<Chunk> {
@@ -559,6 +560,7 @@ pub fn chunk_blends<'a>(
         meshes,
         quality,
         viewport,
+        dirty_rects,
         nearest_layer,
         texture_pool,
     )
@@ -569,6 +571,7 @@ struct WgpuCommandHandler<'a> {
     descriptors: &'a Descriptors,
     quality: StageQuality,
     viewport: PixelRegion,
+    dirty_rects: Option<Vec<PixelRegion>>,
     nearest_layer: LayerRef<'a>,
     meshes: &'a Vec<Mesh>,
     staging_belt: &'a mut wgpu::util::StagingBelt,
@@ -594,6 +597,7 @@ impl<'a> WgpuCommandHandler<'a> {
         meshes: &'a Vec<Mesh>,
         quality: StageQuality,
         viewport: PixelRegion,
+        dirty_rects: Option<&[PixelRegion]>,
         nearest_layer: LayerRef<'a>,
         texture_pool: &'a mut TexturePool,
     ) -> Self {
@@ -608,6 +612,7 @@ impl<'a> WgpuCommandHandler<'a> {
             descriptors,
             quality,
             viewport,
+            dirty_rects: dirty_rects.map(<[PixelRegion]>::to_vec),
             nearest_layer,
             meshes,
             staging_belt,
@@ -702,6 +707,20 @@ impl<'a> WgpuCommandHandler<'a> {
             ));
         }
     }
+
+    fn intersects_dirty(&self, bounds: PixelRegion) -> bool {
+        self.dirty_rects.as_ref().is_none_or(|rects| {
+            rects
+                .iter()
+                .any(|dirty| regions_strictly_intersect(bounds, *dirty))
+        })
+    }
+
+    fn transformed_intersects_dirty(&self, matrix: Matrix, bounds: [f32; 4]) -> bool {
+        self.dirty_rects.as_ref().is_none()
+            || transformed_pixel_bounds(matrix, bounds, self.viewport)
+                .is_some_and(|bounds| self.intersects_dirty(bounds))
+    }
 }
 
 impl CommandHandler for WgpuCommandHandler<'_> {
@@ -713,6 +732,9 @@ impl CommandHandler for WgpuCommandHandler<'_> {
             bounds.intersection(self.viewport)
         };
         if viewport.width() == 0 || viewport.height() == 0 {
+            return;
+        }
+        if !self.intersects_dirty(viewport) {
             return;
         }
         let surface = Surface::for_viewport(
@@ -850,6 +872,9 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                 texture.texture.height() as f32,
             );
         }
+        if !self.transformed_intersects_dirty(matrix, [0.0, 0.0, 1.0, 1.0]) {
+            return;
+        }
         self.add_to_current(matrix, transform.color_transform, |transform_buffer| {
             DrawCommand::RenderBitmap {
                 bitmap,
@@ -869,6 +894,9 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                 texture.texture.height() as f32,
             );
         }
+        if !self.transformed_intersects_dirty(matrix, [0.0, 0.0, 1.0, 1.0]) {
+            return;
+        }
         self.add_to_current(matrix, transform.color_transform, |transform_buffer| {
             DrawCommand::RenderBitmap {
                 bitmap,
@@ -881,6 +909,12 @@ impl CommandHandler for WgpuCommandHandler<'_> {
     }
 
     fn render_shape(&mut self, shape: ShapeHandle, transform: Transform) {
+        let Some(bounds) = as_mesh(&shape).bounds else {
+            return;
+        };
+        if !self.transformed_intersects_dirty(transform.matrix, bounds) {
+            return;
+        }
         self.add_to_current(
             transform.matrix,
             transform.color_transform,
@@ -892,6 +926,9 @@ impl CommandHandler for WgpuCommandHandler<'_> {
     }
 
     fn draw_rect(&mut self, color: Color, matrix: Matrix) {
+        if !self.transformed_intersects_dirty(matrix, [0.0, 0.0, 1.0, 1.0]) {
+            return;
+        }
         self.add_to_current(
             matrix,
             ColorTransform::multiply_from(color),
@@ -907,6 +944,9 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         } else {
             matrix.tx += Twips::HALF_PX;
             matrix.ty += Twips::HALF_PX;
+            if !self.transformed_intersects_dirty(matrix, [0.0, 0.0, 1.0, 1.0]) {
+                return;
+            }
             self.add_to_current(
                 matrix,
                 ColorTransform::multiply_from(color),
@@ -923,6 +963,9 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         } else {
             matrix.tx += Twips::HALF_PX;
             matrix.ty += Twips::HALF_PX;
+            if !self.transformed_intersects_dirty(matrix, [0.0, 0.0, 1.0, 1.0]) {
+                return;
+            }
             self.add_to_current(
                 matrix,
                 ColorTransform::multiply_from(color),
@@ -961,6 +1004,9 @@ impl CommandHandler for WgpuCommandHandler<'_> {
     ) {
         let viewport = bounds.intersection(self.viewport);
         if viewport.width() == 0 || viewport.height() == 0 {
+            return;
+        }
+        if !self.intersects_dirty(viewport) {
             return;
         }
         let surface = Surface::for_viewport(
@@ -1037,5 +1083,99 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                 transform_buffer,
             }
         });
+    }
+}
+
+fn transformed_pixel_bounds(
+    matrix: Matrix,
+    bounds: [f32; 4],
+    viewport: PixelRegion,
+) -> Option<PixelRegion> {
+    let points = [
+        transform_point(matrix, bounds[0], bounds[1]),
+        transform_point(matrix, bounds[2], bounds[1]),
+        transform_point(matrix, bounds[0], bounds[3]),
+        transform_point(matrix, bounds[2], bounds[3]),
+    ];
+    if points.iter().flatten().any(|value| !value.is_finite()) {
+        return Some(viewport);
+    }
+
+    let mut output = [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    for [x, y] in points {
+        output[0] = output[0].min(x);
+        output[1] = output[1].min(y);
+        output[2] = output[2].max(x);
+        output[3] = output[3].max(y);
+    }
+
+    // Match the dirty fingerprint's conservative antialiasing allowance.
+    let left = (output[0] - 2.0).floor().max(viewport.x_min as f32);
+    let top = (output[1] - 2.0).floor().max(viewport.y_min as f32);
+    let right = (output[2] + 2.0).ceil().min(viewport.x_max as f32);
+    let bottom = (output[3] + 2.0).ceil().min(viewport.y_max as f32);
+    (left < right && top < bottom).then_some(PixelRegion {
+        x_min: left as u32,
+        y_min: top as u32,
+        x_max: right as u32,
+        y_max: bottom as u32,
+    })
+}
+
+fn transform_point(matrix: Matrix, x: f32, y: f32) -> [f32; 2] {
+    [
+        matrix.a * x + matrix.c * y + matrix.tx.to_pixels() as f32,
+        matrix.b * x + matrix.d * y + matrix.ty.to_pixels() as f32,
+    ]
+}
+
+fn regions_strictly_intersect(a: PixelRegion, b: PixelRegion) -> bool {
+    a.x_min < b.x_max && a.x_max > b.x_min && a.y_min < b.y_max && a.y_max > b.y_min
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transformed_bounds_are_clipped_and_padded() {
+        let matrix = Matrix {
+            a: 10.0,
+            d: 20.0,
+            tx: Twips::from_pixels(5.0),
+            ty: Twips::from_pixels(7.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            transformed_pixel_bounds(
+                matrix,
+                [0.0, 0.0, 1.0, 1.0],
+                PixelRegion::for_region(6, 8, 7, 12),
+            ),
+            Some(PixelRegion {
+                x_min: 6,
+                y_min: 8,
+                x_max: 13,
+                y_max: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn touching_regions_do_not_intersect() {
+        let left = PixelRegion::for_region(0, 0, 32, 32);
+        assert!(!regions_strictly_intersect(
+            left,
+            PixelRegion::for_region(32, 0, 32, 32),
+        ));
+        assert!(regions_strictly_intersect(
+            left,
+            PixelRegion::for_region(31, 0, 32, 32),
+        ));
     }
 }

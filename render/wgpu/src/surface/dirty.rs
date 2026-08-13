@@ -416,8 +416,8 @@ fn coalesce_tiles(
             let px = x * TILE_SIZE;
             let py = y * TILE_SIZE;
             rects.push(PixelRegion::for_region(
-                px,
-                py,
+                viewport.x_min + px,
+                viewport.y_min + py,
                 (width * TILE_SIZE).min(viewport.width() - px),
                 (height * TILE_SIZE).min(viewport.height() - py),
             ));
@@ -514,6 +514,13 @@ mod tests {
             PixelRegion::for_whole_size(50, 45),
         );
         assert_eq!(rects, vec![PixelRegion::for_region(32, 0, 18, 45)]);
+    }
+
+    #[test]
+    fn dirty_rectangles_preserve_viewport_origin() {
+        let viewport = PixelRegion::for_region(100, 200, 50, 45);
+        let rects = coalesce_tiles(&[false, true, false, true], 2, 2, viewport);
+        assert_eq!(rects, vec![PixelRegion::for_region(132, 200, 18, 45)]);
     }
 
     #[test]

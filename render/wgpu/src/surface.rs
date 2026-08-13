@@ -280,6 +280,7 @@ impl Surface {
             meshes,
             self.quality,
             target.viewport(),
+            dirty_rects,
             match nearest_layer {
                 LayerRef::Current => LayerRef::Parent(&target),
                 layer => layer,
