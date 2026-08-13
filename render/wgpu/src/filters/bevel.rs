@@ -165,7 +165,7 @@ impl BevelFilter {
         let sample_count = source.texture.sample_count();
         let format = source.texture.format();
         let pipeline = self.pipeline(descriptors, sample_count);
-        let blurred = blur_filter.apply(
+        let blurred = blur_filter.apply_alpha(
             descriptors,
             texture_pool,
             draw_encoder,
@@ -236,7 +236,7 @@ impl BevelFilter {
                     0
                 },
                 knockout: if filter.is_knockout() { 1 } else { 0 },
-                composite_source: 1,
+                composite_source: 1 | if blurred.is_some() { 2 } else { 0 },
             }]));
         staging_belt
             .write_buffer(

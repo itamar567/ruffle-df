@@ -39,8 +39,10 @@ fn main_vertex(in: VertexInput) -> VertexOutput {
 fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let inner = filter_args.inner > 0u;
     let knockout = filter_args.knockout > 0u;
-    let composite_source = filter_args.composite_source > 0u;
-    var blur = textureSample(blurred, texture_sampler, in.blur_uv).a;
+    let composite_source = (filter_args.composite_source & 1u) > 0u;
+    let blurred_is_red = (filter_args.composite_source & 2u) > 0u;
+    let blurred_sample = textureSample(blurred, texture_sampler, in.blur_uv);
+    var blur = select(blurred_sample.a, blurred_sample.r, blurred_is_red);
     var dest = textureSample(texture, texture_sampler, in.source_uv);
 
     if (in.blur_uv.x < 0.0 || in.blur_uv.x > 1.0 || in.blur_uv.y < 0.0 || in.blur_uv.y > 1.0) {

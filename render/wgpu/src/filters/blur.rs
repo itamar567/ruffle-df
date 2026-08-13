@@ -34,6 +34,14 @@ pub struct BlurFilter {
     vertices_size: wgpu::BufferSize,
     uniform_size: wgpu::BufferSize,
     pipelines: SampleCountMap<OnceLock<wgpu::RenderPipeline>>,
+    alpha_from_alpha_pipelines: SampleCountMap<OnceLock<wgpu::RenderPipeline>>,
+    alpha_from_red_pipelines: SampleCountMap<OnceLock<wgpu::RenderPipeline>>,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum BlurOutput {
+    Rgba,
+    Alpha,
 }
 
 impl BlurFilter {
@@ -96,6 +104,8 @@ impl BlurFilter {
 
         Self {
             pipelines: Default::default(),
+            alpha_from_alpha_pipelines: Default::default(),
+            alpha_from_red_pipelines: Default::default(),
             pipeline_layout,
             vertex_buffer,
             uniform_buffer,
@@ -103,6 +113,66 @@ impl BlurFilter {
             vertices_size: wgpu::BufferSize::new(vertices_size).expect("Definitely not zero."),
             uniform_size: wgpu::BufferSize::new(uniform_size).expect("Definitely not zero."),
         }
+    }
+
+    fn alpha_pipeline(
+        &self,
+        descriptors: &Descriptors,
+        msaa_sample_count: u32,
+        source_is_red: bool,
+    ) -> &wgpu::RenderPipeline {
+        let pipelines = if source_is_red {
+            &self.alpha_from_red_pipelines
+        } else {
+            &self.alpha_from_alpha_pipelines
+        };
+        pipelines.get_or_init(msaa_sample_count, || {
+            let source_channel = if source_is_red { "red" } else { "alpha" };
+            let label = create_debug_label!(
+                "Alpha blur filter from {} ({} msaa)",
+                source_channel,
+                msaa_sample_count
+            );
+            descriptors
+                .device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: label.as_deref(),
+                    layout: Some(&self.pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &descriptors.shaders.blur_alpha_filter,
+                        entry_point: Some("main_vertex"),
+                        buffers: &VERTEX_BUFFERS_DESCRIPTION_FILTERS,
+                        compilation_options: Default::default(),
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::default(),
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState {
+                        count: msaa_sample_count,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &descriptors.shaders.blur_alpha_filter,
+                        entry_point: Some(if source_is_red {
+                            "main_fragment_from_red"
+                        } else {
+                            "main_fragment_from_alpha"
+                        }),
+                        targets: &[Some(wgpu::TextureFormat::R8Unorm.into())],
+                        compilation_options: Default::default(),
+                    }),
+                    multiview: None,
+                    cache: None,
+                })
+        })
     }
 
     fn pipeline(&self, descriptors: &Descriptors, msaa_sample_count: u32) -> &wgpu::RenderPipeline {
@@ -155,9 +225,53 @@ impl BlurFilter {
         source: &FilterSource,
         filter: &BlurFilterArgs,
     ) -> Option<CommandTarget> {
+        self.apply_inner(
+            descriptors,
+            texture_pool,
+            draw_encoder,
+            staging_belt,
+            source,
+            filter,
+            BlurOutput::Rgba,
+        )
+    }
+
+    pub fn apply_alpha(
+        &self,
+        descriptors: &Descriptors,
+        texture_pool: &mut TexturePool,
+        draw_encoder: &mut wgpu::CommandEncoder,
+        staging_belt: &mut StagingBelt,
+        source: &FilterSource,
+        filter: &BlurFilterArgs,
+    ) -> Option<CommandTarget> {
+        self.apply_inner(
+            descriptors,
+            texture_pool,
+            draw_encoder,
+            staging_belt,
+            source,
+            filter,
+            BlurOutput::Alpha,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn apply_inner(
+        &self,
+        descriptors: &Descriptors,
+        texture_pool: &mut TexturePool,
+        draw_encoder: &mut wgpu::CommandEncoder,
+        staging_belt: &mut StagingBelt,
+        source: &FilterSource,
+        filter: &BlurFilterArgs,
+        output: BlurOutput,
+    ) -> Option<CommandTarget> {
         let sample_count = source.texture.sample_count();
-        let format = source.texture.format();
-        let pipeline = self.pipeline(descriptors, sample_count);
+        let format = match output {
+            BlurOutput::Rgba => source.texture.format(),
+            BlurOutput::Alpha => wgpu::TextureFormat::R8Unorm,
+        };
 
         let mut flip = CommandTarget::new(
             descriptors,
@@ -213,6 +327,7 @@ impl BlurFilter {
                     continue;
                 }
 
+                let source_is_red = !first;
                 let (previous_view, previous_vertices, previous_width, previous_height) = if first {
                     first = false;
                     (
@@ -278,6 +393,13 @@ impl BlurFilter {
                         &descriptors.device,
                     )
                     .copy_from_slice(bytemuck::cast_slice(&[uniform]));
+
+                let pipeline = match output {
+                    BlurOutput::Rgba => self.pipeline(descriptors, sample_count),
+                    BlurOutput::Alpha => {
+                        self.alpha_pipeline(descriptors, sample_count, source_is_red)
+                    }
+                };
 
                 self.render_with_uniform_buffers(
                     descriptors,

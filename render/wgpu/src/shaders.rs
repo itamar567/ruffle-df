@@ -18,6 +18,7 @@ pub struct Shaders {
     pub blend_shaders: EnumMap<ComplexBlend, wgpu::ShaderModule>,
     pub color_matrix_filter: wgpu::ShaderModule,
     pub blur_filter: wgpu::ShaderModule,
+    pub blur_alpha_filter: wgpu::ShaderModule,
     pub glow_filter: wgpu::ShaderModule,
     pub bevel_filter: wgpu::ShaderModule,
     pub displacement_map_filter: wgpu::ShaderModule,
@@ -41,6 +42,11 @@ impl Shaders {
             device,
             "filter/blur.wgsl",
             include_str!("../shaders/filter/blur.wgsl"),
+        );
+        let blur_alpha_filter = make_filter_shader(
+            device,
+            "filter/blur_alpha.wgsl",
+            include_str!("../shaders/filter/blur_alpha.wgsl"),
         );
         let glow_filter = make_filter_shader(
             device,
@@ -89,6 +95,7 @@ impl Shaders {
             blend_shaders,
             color_matrix_filter,
             blur_filter,
+            blur_alpha_filter,
             glow_filter,
             bevel_filter,
             displacement_map_filter,
@@ -108,4 +115,24 @@ fn make_filter_shader(device: &wgpu::Device, name: &str, source: &str) -> wgpu::
         label: create_debug_label!("Shader {name}").as_deref(),
         source: wgpu::ShaderSource::Wgsl(format!("{SHADER_FILTER_COMMON}\n{source}").into()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alpha_blur_shader_is_valid_wgsl() {
+        let source = format!(
+            "{SHADER_FILTER_COMMON}\n{}",
+            include_str!("../shaders/filter/blur_alpha.wgsl")
+        );
+        let module = naga::front::wgsl::parse_str(&source).expect("alpha blur shader should parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("alpha blur shader should validate");
+    }
 }
