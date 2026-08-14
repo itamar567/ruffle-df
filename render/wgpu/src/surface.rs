@@ -514,7 +514,24 @@ impl Surface {
                         wgpu::IndexFormat::Uint32,
                     );
 
-                    render_pass.draw_indexed(0..6, 0, 0..1);
+                    if let Some(rects) = dirty_rects {
+                        let mut drew = false;
+                        for dirty in rects {
+                            let left = dirty.x_min.max(viewport.x_min);
+                            let top = dirty.y_min.max(viewport.y_min);
+                            let right = dirty.x_max.min(viewport.x_max);
+                            let bottom = dirty.y_max.min(viewport.y_max);
+                            if left < right && top < bottom {
+                                render_pass
+                                    .set_scissor_rect(left, top, right - left, bottom - top);
+                                render_pass.draw_indexed(0..6, 0, 0..1);
+                                drew = true;
+                            }
+                        }
+                        debug_assert!(drew, "blend must intersect dirty rects");
+                    } else {
+                        render_pass.draw_indexed(0..6, 0, 0..1);
+                    }
                 }
             }
         }
