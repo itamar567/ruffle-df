@@ -8,7 +8,7 @@ use std::sync::Arc;
 use swf::ColorTransform;
 
 pub const TILE_SIZE: u32 = 32;
-const MAX_DIRTY_TILE_FRACTION_DENOMINATOR: usize = 4;
+const MAX_DIRTY_TILE_FRACTION_DENOMINATOR: usize = 1;
 const HIGH_CHANGE_STREAK_LIMIT: u8 = 3;
 const TRACKING_COOLDOWN_FRAMES: u8 = 10;
 
