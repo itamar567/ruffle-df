@@ -9,7 +9,7 @@ use crate::dynamic_transforms::DynamicTransforms;
 use crate::filters::FilterSource;
 use crate::mesh::Mesh;
 use crate::pixel_bender::{ShaderMode, run_pixelbender_shader_impl};
-use crate::surface::commands::{Chunk, CommandRenderer, chunk_blends};
+use crate::surface::commands::{Chunk, CommandRenderer, chunk_blends, regions_strictly_intersect};
 use crate::utils::supported_sample_count;
 use crate::{Descriptors, MaskState, Pipelines};
 use ruffle_render::bitmap::PixelRegion;
@@ -18,7 +18,7 @@ use ruffle_render::pixel_bender_support::{ImageInputTexture, PixelBenderShaderAr
 use ruffle_render::quality::StageQuality;
 use std::cell::RefCell;
 use std::sync::Arc;
-use target::{CommandTarget, create_region_bind_group};
+use target::{BlendBuffer, CommandTarget, PoolOrArcTexture, create_region_bind_group};
 use tracing::instrument;
 
 use crate::utils::run_copy_pipeline;
@@ -26,6 +26,7 @@ use crate::utils::run_copy_pipeline;
 pub use crate::surface::commands::LayerRef;
 
 use self::commands::ChunkBlendMode;
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct Surface {
@@ -36,6 +37,11 @@ pub struct Surface {
     pipelines: Arc<Pipelines>,
     format: wgpu::TextureFormat,
     dirty_tiles: RefCell<dirty::DirtyTileState>,
+    /// Small cache of `create_region_bind_group` results, keyed by viewport.
+    /// Region bind groups are pure functions of the viewport and are created
+    /// once per complex blend per frame; caching avoids a device.create_buffer
+    /// + create_bind_group per blend.
+    region_bind_groups: RefCell<HashMap<PixelRegion, (wgpu::Buffer, wgpu::BindGroup)>>,
 }
 
 impl Surface {
@@ -96,6 +102,7 @@ impl Surface {
             pipelines,
             format: frame_buffer_format,
             dirty_tiles: RefCell::new(dirty::DirtyTileState::new()),
+            region_bind_groups: RefCell::new(HashMap::new()),
         }
     }
 
@@ -304,7 +311,8 @@ impl Surface {
             texture_pool,
         );
 
-        for chunk in chunks {
+        let mut chunks = chunks.into_iter().peekable();
+        while let Some(chunk) = chunks.next() {
             match chunk {
                 Chunk::Draw {
                     chunk,
@@ -398,79 +406,143 @@ impl Surface {
                     )
                     .expect("Failed to run PixelBender blend mode");
                 }
-                Chunk::Blend {
-                    texture,
-                    blend_mode: ChunkBlendMode::Complex(blend_mode),
-                    needs_stencil,
-                    viewport,
+                first_complex @ Chunk::Blend {
+                    blend_mode: ChunkBlendMode::Complex(_),
+                    ..
                 } => {
-                    let dirty_tiles = dirty_rects.is_some();
-                    let effective_needs_stencil = needs_stencil || dirty_tiles;
-                    let parent = match blend_mode {
-                        ComplexBlend::Alpha | ComplexBlend::Erase => {
-                            match nearest_layer {
-                                LayerRef::None => {
-                                    // An Alpha or Erase with no Layer above it should be ignored
-                                    continue;
-                                }
-                                LayerRef::Current => &target,
-                                LayerRef::Parent(layer) => layer,
-                            }
+                    // Collect a run of consecutive complex blends whose viewports
+                    // don't overlap each other, so they can all be composited in a
+                    // single render pass. Overlapping blends must stay in separate
+                    // passes because each reads the parent region before the
+                    // previous blend's composite lands.
+                    let mut batch = vec![first_complex];
+                    let (batch_needs_stencil, mut batch_viewports) = match &batch[0] {
+                        Chunk::Blend {
+                            needs_stencil,
+                            viewport,
+                            ..
+                        } => (*needs_stencil, vec![*viewport]),
+                        _ => unreachable!(),
+                    };
+                    while let Some(Chunk::Blend {
+                        blend_mode: ChunkBlendMode::Complex(_),
+                        needs_stencil,
+                        viewport,
+                        ..
+                    }) = chunks.peek()
+                    {
+                        // Only batch blends with identical stencil requirements:
+                        // the pass's depth-stencil attachment is fixed at
+                        // begin_render_pass, so mixing them is illegal.
+                        if *needs_stencil != batch_needs_stencil {
+                            break;
                         }
+                        let overlaps = batch_viewports
+                            .iter()
+                            .any(|other| regions_strictly_intersect(*other, *viewport));
+                        if overlaps {
+                            // Can't merge: leave it for the next batch (peeked,
+                            // not consumed).
+                            break;
+                        }
+                        batch_viewports.push(*viewport);
+                        // Consume the peeked chunk into the batch.
+                        match chunks.next() {
+                            Some(chunk) => batch.push(chunk),
+                            None => break,
+                        }
+                    }
+
+                    let (first_texture, first_blend_mode, needs_stencil, first_viewport) =
+                        match batch.remove(0) {
+                            Chunk::Blend {
+                                texture,
+                                blend_mode: ChunkBlendMode::Complex(blend_mode),
+                                needs_stencil,
+                                viewport,
+                            } => (texture, blend_mode, needs_stencil, viewport),
+                            _ => unreachable!(),
+                        };
+
+                    // Prepare the first blend.
+                    let parent = match first_blend_mode {
+                        ComplexBlend::Alpha | ComplexBlend::Erase => match nearest_layer {
+                            LayerRef::None => {
+                                continue;
+                            }
+                            LayerRef::Current => &target,
+                            LayerRef::Parent(layer) => layer,
+                        },
                         _ => &target,
                     };
-
                     let parent_blend_buffer = parent.copy_region_to_blend_buffer(
-                        viewport,
+                        first_viewport,
                         descriptors,
                         texture_pool,
                         draw_encoder,
                     );
-
-                    let blend_bind_group =
-                        descriptors
-                            .device
-                            .create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: create_debug_label!(
-                                    "Complex blend binds {:?} {}",
-                                    blend_mode,
-                                    if effective_needs_stencil {
-                                        "(with stencil)"
-                                    } else {
-                                        "(Stencilless)"
-                                    }
-                                )
-                                .as_deref(),
-                                layout: &descriptors.bind_layouts.blend,
-                                entries: &[
-                                    wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: wgpu::BindingResource::TextureView(
-                                            parent_blend_buffer.view(),
-                                        ),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 1,
-                                        resource: wgpu::BindingResource::TextureView(
-                                            texture.view(),
-                                        ),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 2,
-                                        resource: wgpu::BindingResource::Sampler(
-                                            descriptors.bitmap_samplers.get_sampler(false, false),
-                                        ),
-                                    },
-                                ],
-                            });
-
+                    let blend_bind_group = create_blend_bind_group(
+                        descriptors,
+                        &parent_blend_buffer,
+                        &first_texture,
+                        first_blend_mode,
+                        needs_stencil,
+                    );
                     let (_region_buffer, region_bind_group) =
-                        create_region_bind_group(descriptors, viewport);
+                        self.cached_region_bind_group(descriptors, first_viewport);
+
+                    // Prepare the rest of the batch before opening the pass:
+                    // all parent-buffer copies and bind groups are encoder-level
+                    // work that must complete before the composite pass draws.
+                    let mut rest = Vec::with_capacity(batch.len());
+                    for chunk in batch {
+                        let Chunk::Blend {
+                            texture,
+                            blend_mode: ChunkBlendMode::Complex(blend_mode),
+                            needs_stencil: _,
+                            viewport,
+                        } = chunk
+                        else {
+                            unreachable!("batch only contains complex blends");
+                        };
+                        let parent = match blend_mode {
+                            ComplexBlend::Alpha | ComplexBlend::Erase => match nearest_layer {
+                                LayerRef::None => continue,
+                                LayerRef::Current => &target,
+                                LayerRef::Parent(layer) => layer,
+                            },
+                            _ => &target,
+                        };
+                        let parent_blend_buffer = parent.copy_region_to_blend_buffer(
+                            viewport,
+                            descriptors,
+                            texture_pool,
+                            draw_encoder,
+                        );
+                        let blend_bind_group = create_blend_bind_group(
+                            descriptors,
+                            &parent_blend_buffer,
+                            &texture,
+                            blend_mode,
+                            false,
+                        );
+                        let (_region_buffer, region_bind_group) =
+                            self.cached_region_bind_group(descriptors, viewport);
+                        rest.push((
+                            blend_mode,
+                            region_bind_group,
+                            blend_bind_group,
+                            viewport,
+                        ));
+                    }
+
+                    let dirty_tiles = dirty_rects.is_some();
+                    let effective_needs_stencil = needs_stencil || dirty_tiles;
                     let mut render_pass =
                         draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: create_debug_label!(
-                                "Complex blend {:?} {}",
-                                blend_mode,
+                                "Complex blend batch {:?} {}",
+                                first_blend_mode,
                                 if effective_needs_stencil {
                                     "(with stencil)"
                                 } else {
@@ -487,66 +559,42 @@ impl Surface {
                             ..Default::default()
                         });
                     render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
-
-                    if dirty_tiles {
-                        let reference = match mask_state {
-                            MaskState::NoMask => num_masks,
-                            MaskState::DrawMaskStencil => num_masks - 1,
-                            MaskState::DrawMaskedContent | MaskState::ClearMaskStencil => num_masks,
-                        };
-                        render_pass.set_stencil_reference(0x80 | reference);
-                        render_pass.set_pipeline(
-                            self.pipelines.complex_blends[blend_mode]
-                                .dirty_pipeline_for(mask_state),
-                        );
-                    } else if needs_stencil {
-                        match mask_state {
-                            MaskState::NoMask => {}
-                            MaskState::DrawMaskStencil => {
-                                render_pass.set_stencil_reference(num_masks - 1);
-                            }
-                            MaskState::DrawMaskedContent => {
-                                render_pass.set_stencil_reference(num_masks);
-                            }
-                            MaskState::ClearMaskStencil => {
-                                render_pass.set_stencil_reference(num_masks);
-                            }
-                        }
-                        render_pass.set_pipeline(
-                            self.pipelines.complex_blends[blend_mode].pipeline_for(mask_state),
-                        );
-                    } else {
-                        render_pass.set_pipeline(
-                            self.pipelines.complex_blends[blend_mode].stencilless_pipeline(),
-                        );
-                    }
-
-                    render_pass.set_bind_group(1, &region_bind_group, &[0]);
-                    render_pass.set_bind_group(2, &blend_bind_group, &[]);
-
                     render_pass.set_vertex_buffer(0, descriptors.quad.vertices_pos.slice(..));
                     render_pass.set_index_buffer(
                         descriptors.quad.indices.slice(..),
                         wgpu::IndexFormat::Uint32,
                     );
 
-                    if let Some(rects) = dirty_rects {
-                        let mut drew = false;
-                        for dirty in rects {
-                            let left = dirty.x_min.max(viewport.x_min);
-                            let top = dirty.y_min.max(viewport.y_min);
-                            let right = dirty.x_max.min(viewport.x_max);
-                            let bottom = dirty.y_max.min(viewport.y_max);
-                            if left < right && top < bottom {
-                                render_pass
-                                    .set_scissor_rect(left, top, right - left, bottom - top);
-                                render_pass.draw_indexed(0..6, 0, 0..1);
-                                drew = true;
-                            }
-                        }
-                        debug_assert!(drew, "blend must intersect dirty rects");
-                    } else {
-                        render_pass.draw_indexed(0..6, 0, 0..1);
+                    // Composite the first blend.
+                    composite_blend(
+                        &mut render_pass,
+                        &self.pipelines,
+                        num_masks,
+                        mask_state,
+                        dirty_tiles,
+                        needs_stencil,
+                        first_blend_mode,
+                        &region_bind_group,
+                        &blend_bind_group,
+                        first_viewport,
+                        dirty_rects,
+                    );
+
+                    // Composite the rest of the batch (already proven non-overlapping).
+                    for (blend_mode, region_bind_group, blend_bind_group, viewport) in rest {
+                        composite_blend(
+                            &mut render_pass,
+                            &self.pipelines,
+                            num_masks,
+                            mask_state,
+                            dirty_tiles,
+                            batch_needs_stencil,
+                            blend_mode,
+                            &region_bind_group,
+                            &blend_bind_group,
+                            viewport,
+                            dirty_rects,
+                        );
                     }
                 }
             }
@@ -562,11 +610,136 @@ impl Surface {
         self.quality
     }
 
+    /// Returns the region bind group for `viewport`, creating it on first use
+    /// and caching it for subsequent blends with the same viewport.
+    pub fn cached_region_bind_group(
+        &self,
+        descriptors: &Descriptors,
+        viewport: PixelRegion,
+    ) -> (wgpu::Buffer, wgpu::BindGroup) {
+        if let Some(cached) = self.region_bind_groups.borrow().get(&viewport) {
+            return cached.clone();
+        }
+        let created = create_region_bind_group(descriptors, viewport);
+        self.region_bind_groups
+            .borrow_mut()
+            .insert(viewport, created.clone());
+        created
+    }
+
     pub fn sample_count(&self) -> u32 {
         self.sample_count
     }
 
     pub fn size(&self) -> wgpu::Extent3d {
         self.size
+    }
+}
+
+/// Creates the bind group binding a complex blend's parent buffer and
+/// foreground texture.
+fn create_blend_bind_group(
+    descriptors: &Descriptors,
+    parent_blend_buffer: &BlendBuffer,
+    texture: &PoolOrArcTexture,
+    blend_mode: ComplexBlend,
+    needs_stencil: bool,
+) -> wgpu::BindGroup {
+    descriptors
+        .device
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: create_debug_label!(
+                "Complex blend binds {:?} {}",
+                blend_mode,
+                if needs_stencil {
+                    "(with stencil)"
+                } else {
+                    "(Stencilless)"
+                }
+            )
+            .as_deref(),
+            layout: &descriptors.bind_layouts.blend,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(parent_blend_buffer.view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(texture.view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(
+                        descriptors.bitmap_samplers.get_sampler(false, false),
+                    ),
+                },
+            ],
+        })
+}
+
+/// Sets up the pipeline/stencil state for one complex blend and draws its
+/// (scissored) quad into `render_pass`.
+#[expect(clippy::too_many_arguments)]
+fn composite_blend(
+    render_pass: &mut wgpu::RenderPass<'_>,
+    pipelines: &Pipelines,
+    num_masks: u32,
+    mask_state: MaskState,
+    dirty_tiles: bool,
+    needs_stencil: bool,
+    blend_mode: ComplexBlend,
+    region_bind_group: &wgpu::BindGroup,
+    blend_bind_group: &wgpu::BindGroup,
+    viewport: PixelRegion,
+    dirty_rects: Option<&[PixelRegion]>,
+) {
+    if dirty_tiles {
+        let reference = match mask_state {
+            MaskState::NoMask => num_masks,
+            MaskState::DrawMaskStencil => num_masks - 1,
+            MaskState::DrawMaskedContent | MaskState::ClearMaskStencil => num_masks,
+        };
+        render_pass.set_stencil_reference(0x80 | reference);
+        render_pass.set_pipeline(
+            pipelines.complex_blends[blend_mode].dirty_pipeline_for(mask_state),
+        );
+    } else if needs_stencil {
+        match mask_state {
+            MaskState::NoMask => {}
+            MaskState::DrawMaskStencil => {
+                render_pass.set_stencil_reference(num_masks - 1);
+            }
+            MaskState::DrawMaskedContent => {
+                render_pass.set_stencil_reference(num_masks);
+            }
+            MaskState::ClearMaskStencil => {
+                render_pass.set_stencil_reference(num_masks);
+            }
+        }
+        render_pass.set_pipeline(pipelines.complex_blends[blend_mode].pipeline_for(mask_state));
+    } else {
+        render_pass.set_pipeline(pipelines.complex_blends[blend_mode].stencilless_pipeline());
+    }
+
+    render_pass.set_bind_group(1, region_bind_group, &[0]);
+    render_pass.set_bind_group(2, blend_bind_group, &[]);
+
+    if let Some(rects) = dirty_rects {
+        let mut drew = false;
+        for dirty in rects {
+            let left = dirty.x_min.max(viewport.x_min);
+            let top = dirty.y_min.max(viewport.y_min);
+            let right = dirty.x_max.min(viewport.x_max);
+            let bottom = dirty.y_max.min(viewport.y_max);
+            if left < right && top < bottom {
+                render_pass.set_scissor_rect(left, top, right - left, bottom - top);
+                render_pass.draw_indexed(0..6, 0, 0..1);
+                drew = true;
+            }
+        }
+        debug_assert!(drew, "blend must intersect dirty rects");
+    } else {
+        render_pass.draw_indexed(0..6, 0, 0..1);
     }
 }

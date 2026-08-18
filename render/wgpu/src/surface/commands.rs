@@ -1136,7 +1136,7 @@ fn transform_point(matrix: Matrix, x: f32, y: f32) -> [f32; 2] {
     ]
 }
 
-fn regions_strictly_intersect(a: PixelRegion, b: PixelRegion) -> bool {
+pub(crate) fn regions_strictly_intersect(a: PixelRegion, b: PixelRegion) -> bool {
     a.x_min < b.x_max && a.x_max > b.x_min && a.y_min < b.y_max && a.y_max > b.y_min
 }
 
