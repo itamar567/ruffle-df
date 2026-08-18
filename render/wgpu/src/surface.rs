@@ -60,6 +60,22 @@ impl Surface {
         viewport: PixelRegion,
         frame_buffer_format: wgpu::TextureFormat,
     ) -> Self {
+        Self::for_viewport_with_sample_count(
+            descriptors,
+            quality,
+            viewport,
+            frame_buffer_format,
+            quality.sample_count(),
+        )
+    }
+
+    pub fn for_viewport_with_sample_count(
+        descriptors: &Descriptors,
+        quality: StageQuality,
+        viewport: PixelRegion,
+        frame_buffer_format: wgpu::TextureFormat,
+        sample_count: u32,
+    ) -> Self {
         let size = wgpu::Extent3d {
             width: viewport.width(),
             height: viewport.height(),
@@ -68,7 +84,7 @@ impl Surface {
 
         let sample_count = supported_sample_count(
             &descriptors.adapter,
-            quality.sample_count(),
+            sample_count,
             frame_buffer_format,
         );
         let pipelines = descriptors.pipelines(sample_count, frame_buffer_format);

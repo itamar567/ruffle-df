@@ -737,11 +737,12 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         if !self.intersects_dirty(viewport) {
             return;
         }
-        let surface = Surface::for_viewport(
+        let surface = Surface::for_viewport_with_sample_count(
             self.descriptors,
             self.quality,
             viewport,
             wgpu::TextureFormat::Rgba8Unorm,
+            1,
         );
         let target_layer = if let RenderBlendMode::Builtin(BlendMode::Layer) = &blend_mode {
             LayerRef::Current
@@ -1009,11 +1010,12 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         if !self.intersects_dirty(viewport) {
             return;
         }
-        let surface = Surface::for_viewport(
+        let surface = Surface::for_viewport_with_sample_count(
             self.descriptors,
             self.quality,
             viewport,
             wgpu::TextureFormat::Rgba8Unorm,
+            1,
         );
 
         let maskee = surface.draw_commands(
