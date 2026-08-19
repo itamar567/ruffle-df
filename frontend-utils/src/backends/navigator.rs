@@ -37,6 +37,12 @@ pub trait NavigatorInterface: Clone + Send + 'static {
         host: &str,
         port: u16,
     ) -> impl std::future::Future<Output = bool> + Send;
+
+    /// Returns true if a `javascript:` URL is allowed to be executed.
+    /// By default, all javascript URLs are blocked.
+    fn is_javascript_url_allowed(&self, _url: &Url) -> bool {
+        false
+    }
 }
 
 pub trait FutureSpawner<Err> {
@@ -175,7 +181,7 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
             _ => parsed_url,
         };
 
-        if modified_url.scheme() == "javascript" {
+        if modified_url.scheme() == "javascript" && !self.interface.is_javascript_url_allowed(&modified_url) {
             tracing::warn!(
                 "SWF tried to run a script on desktop, but javascript calls are not allowed"
             );

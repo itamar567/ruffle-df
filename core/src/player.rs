@@ -2828,6 +2828,7 @@ pub struct PlayerBuilder {
     avm2_optimizer_enabled: bool,
     #[cfg(feature = "default_font")]
     default_font: bool,
+    local_connection_listeners: Option<crate::local_connection::LocalConnectionListeners>,
 }
 
 impl PlayerBuilder {
@@ -2884,6 +2885,7 @@ impl PlayerBuilder {
             avm2_optimizer_enabled: true,
             #[cfg(feature = "default_font")]
             default_font: true,
+            local_connection_listeners: None,
         }
     }
 
@@ -3111,6 +3113,15 @@ impl PlayerBuilder {
         self
     }
 
+    /// Sets external listeners for LocalConnection messages.
+    pub fn with_local_connection_listeners(
+        mut self,
+        listeners: crate::local_connection::LocalConnectionListeners,
+    ) -> Self {
+        self.local_connection_listeners = Some(listeners);
+        self
+    }
+
     fn create_gc_root<'gc>(
         gc_context: &'gc Mutation<'gc>,
         player_version: u8,
@@ -3119,6 +3130,7 @@ impl PlayerBuilder {
         fake_movie: Arc<SwfMovie>,
         external_interface_provider: Option<Box<dyn ExternalInterfaceProvider>>,
         fs_command_provider: Box<dyn FsCommandProvider>,
+        local_connection_listeners: Option<crate::local_connection::LocalConnectionListeners>,
     ) -> GcRoot<'gc> {
         let mut interner = AvmStringInterner::new(gc_context);
         let (avm1, avm2) = {
@@ -3165,7 +3177,13 @@ impl PlayerBuilder {
             stream_manager: StreamManager::new(),
             sockets: Sockets::empty(),
             net_connections: NetConnections::default(),
-            local_connections: LocalConnections::empty(),
+            local_connections: {
+                let mut lc = LocalConnections::empty();
+                if let Some(listeners) = local_connection_listeners {
+                    lc.set_external_listeners(listeners);
+                }
+                lc
+            },
             orphan_manager: OrphanManager::default(),
             dynamic_root: DynamicRootSet::new(gc_context),
             post_frame_callbacks: Vec::new(),
@@ -3286,6 +3304,7 @@ impl PlayerBuilder {
                         fake_movie.clone(),
                         self.external_interface_provider,
                         self.fs_command_provider,
+                        self.local_connection_listeners,
                     )
                 }))),
             })

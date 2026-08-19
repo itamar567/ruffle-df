@@ -11,6 +11,22 @@ use gc_arena::collect::Trace;
 use ruffle_macros::istr;
 use ruffle_wstr::{WStr, WString};
 use std::borrow::Cow;
+use std::sync::{Arc, Mutex};
+
+/// A message received from a LocalConnection send operation.
+pub struct LocalConnectionMessage {
+    pub channel: String,
+    pub method: String,
+    pub arguments: Vec<String>,
+}
+
+/// Trait for listening to LocalConnection messages.
+pub trait LocalConnectionListener: Send + Sync {
+    fn on_message(&self, message: &LocalConnectionMessage);
+}
+
+/// Shared list of external listeners.
+pub type LocalConnectionListeners = Arc<Mutex<Vec<Arc<dyn LocalConnectionListener>>>>;
 
 #[derive(Clone, Collect)]
 #[collect(no_drop)]
@@ -97,10 +113,35 @@ impl<'gc> QueuedMessageKind<'gc> {
                 method_name,
                 arguments,
             } => {
+                // Check for external listeners first
+                let mut delivered_to_external = false;
+                if let Some(listeners) = &context.local_connections.external_listeners {
+                    if let Ok(listeners) = listeners.lock() {
+                        let arg_strings: Vec<String> = arguments.iter().map(|arg| {
+                            match arg {
+                                flash_lso::types::Value::String(s) => s.to_string(),
+                                other => format!("{:?}", other),
+                            }
+                        }).collect();
+                        
+                        let message = LocalConnectionMessage {
+                            channel: connection_name.to_string(),
+                            method: method_name.to_string(),
+                            arguments: arg_strings,
+                        };
+                        
+                        for listener in listeners.iter() {
+                            listener.on_message(&message);
+                            delivered_to_external = true;
+                        }
+                    }
+                }
+                
+                // Also check for AVM1 listeners
                 if let Some(receiver) = context.local_connections.find_listener(&connection_name) {
                     source.send_status(istr!(context, "status"), context);
                     receiver.run_method(context, method_name, arguments);
-                } else {
+                } else if !delivered_to_external {
                     source.send_status(istr!(context, "error"), context);
                 }
             }
@@ -118,6 +159,7 @@ pub struct LocalConnectionHandle(WString);
 pub struct LocalConnections<'gc> {
     connections: FnvHashMap<WString, LocalConnectionKind<'gc>>,
     messages: Vec<QueuedMessage<'gc>>,
+    external_listeners: Option<LocalConnectionListeners>,
 }
 
 // TODO(moulins): use gc_arena::Static to avoid unsafe impl?
@@ -135,7 +177,12 @@ impl<'gc> LocalConnections<'gc> {
         Self {
             connections: Default::default(),
             messages: Default::default(),
+            external_listeners: None,
         }
+    }
+
+    pub fn set_external_listeners(&mut self, listeners: LocalConnectionListeners) {
+        self.external_listeners = Some(listeners);
     }
 
     pub fn connect<C: Into<LocalConnectionKind<'gc>>>(
@@ -189,7 +236,13 @@ impl<'gc> LocalConnections<'gc> {
             connection_name = result;
         }
 
-        let kind = if self.find_listener(&connection_name).is_some() {
+        // Check if there's an AVM1 listener or external listeners
+        let has_avm1_listener = self.find_listener(&connection_name).is_some();
+        let has_external_listeners = self.external_listeners.as_ref().map_or(false, |l| {
+            l.lock().map_or(false, |listeners| !listeners.is_empty())
+        });
+
+        let kind = if has_avm1_listener || has_external_listeners {
             QueuedMessageKind::Message {
                 connection_name,
                 method_name,
