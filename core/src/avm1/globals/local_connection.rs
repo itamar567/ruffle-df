@@ -6,7 +6,7 @@ use crate::avm1::error::Error;
 use crate::avm1::property_decl::{DeclContext, PropertyOrder, StaticDeclarations, SystemClass};
 use crate::avm1::{ActivationIdentifier, ExecutionReason, NativeObject, Object, Value};
 use crate::avm1_stub;
-use crate::context::UpdateContext;
+use crate::context::{ActionType, UpdateContext};
 use crate::display_object::TDisplayObject;
 use crate::local_connection::{LocalConnectionHandle, LocalConnections};
 use crate::string::AvmString;
@@ -56,6 +56,23 @@ impl<'gc> LocalConnection<'gc> {
         );
         let result = connection_handle.is_some();
         *self.0.handle.borrow_mut() = connection_handle;
+
+        // Queue doAfterLoad callback to be called after connect() returns.
+        // The SWF sets doAfterLoad AFTER calling connect(), so we can't call it synchronously.
+        if result {
+            if let Some(root_clip) = activation.context.stage.root_clip() {
+                activation.context.action_queue.queue_action(
+                    root_clip,
+                    ActionType::Method {
+                        object: this,
+                        name: istr!("doAfterLoad"),
+                        args: vec![],
+                    },
+                    false,
+                );
+            }
+        }
+
         result
     }
 

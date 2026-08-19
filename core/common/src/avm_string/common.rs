@@ -116,6 +116,7 @@ ruffle_macros::define_common_strings! {
     "constructor",
     "customItems",
     "data",
+    "doAfterLoad",
     "decimal",
     "declaredBy",
     "decode",
