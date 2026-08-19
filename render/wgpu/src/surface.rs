@@ -532,7 +532,6 @@ impl Surface {
                             blend_mode,
                             region_bind_group,
                             blend_bind_group,
-                            viewport,
                         ));
                     }
 
@@ -576,12 +575,10 @@ impl Surface {
                         first_blend_mode,
                         &region_bind_group,
                         &blend_bind_group,
-                        first_viewport,
-                        dirty_rects,
                     );
 
                     // Composite the rest of the batch (already proven non-overlapping).
-                    for (blend_mode, region_bind_group, blend_bind_group, viewport) in rest {
+                    for (blend_mode, region_bind_group, blend_bind_group) in rest {
                         composite_blend(
                             &mut render_pass,
                             &self.pipelines,
@@ -592,8 +589,6 @@ impl Surface {
                             blend_mode,
                             &region_bind_group,
                             &blend_bind_group,
-                            viewport,
-                            dirty_rects,
                         );
                     }
                 }
@@ -679,8 +674,7 @@ fn create_blend_bind_group(
 }
 
 /// Sets up the pipeline/stencil state for one complex blend and draws its
-/// (scissored) quad into `render_pass`.
-#[expect(clippy::too_many_arguments)]
+/// quad into `render_pass`.
 fn composite_blend(
     render_pass: &mut wgpu::RenderPass<'_>,
     pipelines: &Pipelines,
@@ -691,8 +685,6 @@ fn composite_blend(
     blend_mode: ComplexBlend,
     region_bind_group: &wgpu::BindGroup,
     blend_bind_group: &wgpu::BindGroup,
-    viewport: PixelRegion,
-    dirty_rects: Option<&[PixelRegion]>,
 ) {
     if dirty_tiles {
         let reference = match mask_state {
@@ -725,21 +717,5 @@ fn composite_blend(
     render_pass.set_bind_group(1, region_bind_group, &[0]);
     render_pass.set_bind_group(2, blend_bind_group, &[]);
 
-    if let Some(rects) = dirty_rects {
-        let mut drew = false;
-        for dirty in rects {
-            let left = dirty.x_min.max(viewport.x_min);
-            let top = dirty.y_min.max(viewport.y_min);
-            let right = dirty.x_max.min(viewport.x_max);
-            let bottom = dirty.y_max.min(viewport.y_max);
-            if left < right && top < bottom {
-                render_pass.set_scissor_rect(left, top, right - left, bottom - top);
-                render_pass.draw_indexed(0..6, 0, 0..1);
-                drew = true;
-            }
-        }
-        debug_assert!(drew, "blend must intersect dirty rects");
-    } else {
-        render_pass.draw_indexed(0..6, 0, 0..1);
-    }
+    render_pass.draw_indexed(0..6, 0, 0..1);
 }
