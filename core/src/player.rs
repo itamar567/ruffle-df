@@ -130,6 +130,26 @@ pub struct MouseData<'gc> {
     pub pressed: Option<InteractiveObject<'gc>>,
     pub right_pressed: Option<InteractiveObject<'gc>>,
     pub middle_pressed: Option<InteractiveObject<'gc>>,
+
+    /// Cached mouse pick result to avoid redundant O(n) tree traversals.
+    cached_mouse_pick: Option<InteractiveObject<'gc>>,
+
+    /// The position when the cache was populated.
+    #[collect(require_static)]
+    cached_mouse_pick_position: Point<Twips>,
+
+    /// The require_button_mode when the cache was populated.
+    #[collect(require_static)]
+    cached_mouse_pick_require_button_mode: bool,
+
+    /// The frame counter when the cache was last populated.
+    #[collect(require_static)]
+    cached_mouse_pick_frame: u64,
+
+    /// Monotonic frame counter for cache invalidation.
+    /// Incremented at the start of each frame.
+    #[collect(require_static)]
+    pub frame_counter: u64,
 }
 
 impl<'gc> MouseData<'gc> {
@@ -149,6 +169,47 @@ impl<'gc> MouseData<'gc> {
             MouseButton::Right => self.right_pressed = value,
             MouseButton::Middle => self.middle_pressed = value,
         }
+    }
+
+    /// Get cached mouse pick if valid for the given parameters.
+    pub fn get_cached_mouse_pick(
+        &self,
+        frame_counter: u64,
+        position: Point<Twips>,
+        require_button_mode: bool,
+    ) -> Option<InteractiveObject<'gc>> {
+        if self.cached_mouse_pick_frame == frame_counter
+            && self.cached_mouse_pick_position == position
+            && self.cached_mouse_pick_require_button_mode == require_button_mode
+        {
+            self.cached_mouse_pick
+        } else {
+            None
+        }
+    }
+
+    /// Cache the mouse pick result.
+    pub fn set_cached_mouse_pick(
+        &mut self,
+        frame_counter: u64,
+        position: Point<Twips>,
+        require_button_mode: bool,
+        result: InteractiveObject<'gc>,
+    ) {
+        self.cached_mouse_pick = Some(result);
+        self.cached_mouse_pick_position = position;
+        self.cached_mouse_pick_require_button_mode = require_button_mode;
+        self.cached_mouse_pick_frame = frame_counter;
+    }
+
+    /// Invalidate the mouse pick cache. Called when ActionScript may have modified the display list.
+    pub fn invalidate_mouse_pick_cache(&mut self) {
+        self.cached_mouse_pick = None;
+    }
+
+    /// Clear the mouse pick cache at frame boundaries.
+    pub fn clear_mouse_pick_cache(&mut self) {
+        self.cached_mouse_pick = None;
     }
 }
 
@@ -361,6 +422,10 @@ pub struct Player {
 
     mouse_in_stage: bool,
     mouse_position: Point<Twips>,
+
+    /// Pending mouse move event to be processed.
+    /// Used to coalesce multiple mouse move events into one per frame.
+    pending_mouse_move: Option<(f64, f64, MouseInputSource)>,
 
     /// The current mouse cursor icon.
     mouse_cursor: MouseCursor,
@@ -1028,11 +1093,22 @@ impl Player {
     /// Handle an event sent into the player from the external windowing system
     /// or an HTML element.
     pub fn handle_event(&mut self, event: PlayerEvent) -> bool {
+        // Coalesce mouse move events: only store the latest position, don't process yet.
+        // The pending move will be processed when a non-mouse-move event arrives or at frame end.
+        if let PlayerEvent::MouseMove { x, y, source } = event {
+            self.pending_mouse_move = Some((x, y, source));
+            return false;
+        }
+
+        // Process any pending mouse move before handling this event
+        if let Some((x, y, source)) = self.pending_mouse_move.take() {
+            self.handle_input_event(PlayerEvent::MouseMove { x, y, source });
+        }
+
         match event {
             PlayerEvent::FocusGained | PlayerEvent::FocusLost => self.handle_focus_event(event),
             PlayerEvent::KeyDown { .. }
             | PlayerEvent::KeyUp { .. }
-            | PlayerEvent::MouseMove { .. }
             | PlayerEvent::MouseUp { .. }
             | PlayerEvent::MouseDown { .. }
             | PlayerEvent::MouseLeave
@@ -1042,6 +1118,8 @@ impl Player {
             | PlayerEvent::Ime { .. }
             | PlayerEvent::TextInput { .. }
             | PlayerEvent::TextControl { .. } => self.handle_input_event(event),
+            // MouseMove is handled above (coalesced)
+            PlayerEvent::MouseMove { .. } => unreachable!(),
         }
     }
 
@@ -1312,6 +1390,12 @@ impl Player {
                 && context.stage.handle_clip_event(context, clip_event) == ClipEventResult::Handled
             {
                 player_event_handled = true;
+            }
+
+            // Invalidate mouse pick cache for events that might trigger display list changes.
+            // Only MouseMove is safe to cache - all other events can run ActionScript.
+            if should_invalidate_mouse_pick_cache(&event) {
+                context.mouse_data.invalidate_mouse_pick_cache();
             }
 
             // Fire event listener on appropriate object
@@ -2033,6 +2117,11 @@ impl Player {
 
     #[instrument(level = "debug", skip_all)]
     pub fn run_frame(&mut self) {
+        // Process any pending mouse move at frame start
+        if let Some((x, y, source)) = self.pending_mouse_move.take() {
+            self.handle_input_event(PlayerEvent::MouseMove { x, y, source });
+        }
+
         let frame_time = self.frame_time(750_000_000.0);
         let frame_time = Duration::from_nanos(frame_time as u64);
         let (mut execution_limit, may_execute_while_streaming) = match self.load_behavior {
@@ -2053,6 +2142,9 @@ impl Player {
         }
 
         self.update(|context| {
+            // Increment frame counter for mouse pick cache invalidation
+            context.mouse_data.frame_counter = context.mouse_data.frame_counter.wrapping_add(1);
+
             // TODO: Is this order correct?
             run_all_phases_avm2(context);
             Avm1::run_frame(context);
@@ -3059,6 +3151,11 @@ impl PlayerBuilder {
                 pressed: None,
                 right_pressed: None,
                 middle_pressed: None,
+                cached_mouse_pick: None,
+                cached_mouse_pick_position: Point::ZERO,
+                cached_mouse_pick_require_button_mode: false,
+                cached_mouse_pick_frame: 0,
+                frame_counter: 0,
             },
             avm1_shared_objects: HashMap::new(),
             avm2_shared_objects: HashMap::new(),
@@ -3148,6 +3245,7 @@ impl PlayerBuilder {
                 input: InputManager::new(self.gamepad_button_mapping),
                 mouse_in_stage: true,
                 mouse_position: Point::ZERO,
+                pending_mouse_move: None,
                 mouse_cursor: MouseCursor::Arrow,
                 mouse_cursor_needs_check: false,
 
@@ -3306,11 +3404,23 @@ fn run_mouse_pick<'gc>(
     context: &mut UpdateContext<'gc>,
     require_button_mode: bool,
 ) -> Option<InteractiveObject<'gc>> {
-    context.stage.iter_render_list().rev().find_map(|level| {
+    let position = *context.mouse_position;
+    let frame_counter = context.mouse_data.frame_counter;
+
+    // Check cache first - O(1) amortized for repeated positions within a frame
+    if let Some(cached) = context
+        .mouse_data
+        .get_cached_mouse_pick(frame_counter, position, require_button_mode)
+    {
+        return Some(cached);
+    }
+
+    // Cache miss - perform the expensive O(n) tree traversal
+    let result = context.stage.iter_render_list().rev().find_map(|level| {
         level.as_interactive().and_then(|l| {
             if l.as_displayobject().movie().is_action_script_3() {
                 let pick = l
-                    .mouse_pick_avm2(context, *context.mouse_position, require_button_mode)
+                    .mouse_pick_avm2(context, position, require_button_mode)
                     .combine_with_parent(context.stage.into());
 
                 if let Avm2MousePick::Hit(target) = pick {
@@ -3325,10 +3435,28 @@ fn run_mouse_pick<'gc>(
                     None
                 }
             } else {
-                l.mouse_pick_avm1(context, *context.mouse_position, require_button_mode)
+                l.mouse_pick_avm1(context, position, require_button_mode)
             }
         })
-    })
+    });
+
+    // Cache the result for future calls at this position in this frame
+    if let Some(result) = result {
+        context
+            .mouse_data
+            .set_cached_mouse_pick(frame_counter, position, require_button_mode, result);
+        Some(result)
+    } else {
+        // Don't cache misses - they might become hits if display list changes
+        None
+    }
+}
+
+/// Returns true if the mouse pick cache should be invalidated after this event.
+/// Only mouse move events are safe to cache - all other events can trigger
+/// ActionScript that modifies the display list (e.g. removeChild).
+fn should_invalidate_mouse_pick_cache(event: &InputEvent) -> bool {
+    !matches!(event, InputEvent::MouseMove { .. })
 }
 
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
