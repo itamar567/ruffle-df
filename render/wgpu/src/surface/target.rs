@@ -7,7 +7,7 @@ use crate::globals::Globals;
 use crate::utils::create_buffer_with_data;
 use crate::utils::run_copy_pipeline;
 use ruffle_render::bitmap::PixelRegion;
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -158,6 +158,25 @@ impl BlendBuffer {
     }
 }
 
+#[derive(Debug, Default)]
+struct ResolveState {
+    pending: Cell<bool>,
+}
+
+impl ResolveState {
+    fn defer(&self) {
+        self.pending.set(true);
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending.get()
+    }
+
+    fn mark_resolved(&self) {
+        self.pending.set(false);
+    }
+}
+
 #[derive(Debug)]
 pub struct StencilBuffer {
     texture: PoolEntry<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>,
@@ -197,6 +216,7 @@ pub struct CommandTarget {
     sample_count: u32,
     whole_frame_bind_group: OnceCell<(wgpu::Buffer, wgpu::BindGroup)>,
     color_needs_clear: OnceCell<bool>,
+    resolve_state: ResolveState,
     render_target_mode: RenderTargetMode,
 }
 
@@ -339,6 +359,7 @@ impl CommandTarget {
             sample_count,
             whole_frame_bind_group,
             color_needs_clear: OnceCell::new(),
+            resolve_state: ResolveState::default(),
             render_target_mode,
         }
     }
@@ -365,12 +386,12 @@ impl CommandTarget {
     }
 
     pub fn ensure_cleared(&self, encoder: &mut wgpu::CommandEncoder) {
-        if self.color_needs_clear.get().is_some() {
+        if self.color_needs_clear.get().is_some() && !self.resolve_state.is_pending() {
             return;
         }
-        // If we aren't clearing with a color (eg a texture instead)
-        // the there's no point in creating a new render pass that does nothing.
-        if self.render_target_mode.color().is_some() {
+        // If we aren't clearing with a color (eg a texture instead), the only
+        // reason to create a pass is to resolve a deferred dirty-tile pass.
+        if self.render_target_mode.color().is_some() || self.resolve_state.is_pending() {
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: create_debug_label!("Clearing command target").as_deref(),
                 color_attachments: &[self.color_attachments()],
@@ -392,10 +413,11 @@ impl CommandTarget {
             create_region_bind_group_with_color(descriptors, self.viewport, clear);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: create_debug_label!("Mark and clear dirty tiles").as_deref(),
-            color_attachments: &[self.color_attachments()],
+            color_attachments: &[Some(dirty_tile_color_attachment(self.frame_buffer.view()))],
             depth_stencil_attachment: self.stencil_attachment(descriptors, pool),
             ..Default::default()
         });
+        self.resolve_state.defer();
         pass.set_bind_group(0, self.globals().bind_group(), &[]);
         pass.set_bind_group(1, &clear_bind_group, &[0]);
         pass.set_stencil_reference(0x80);
@@ -426,12 +448,14 @@ impl CommandTarget {
     }
 
     pub fn color_attachments(&self) -> Option<wgpu::RenderPassColorAttachment<'_>> {
-        let mut load = wgpu::LoadOp::Load;
-        if self.color_needs_clear.set(false).is_ok()
-            && let Some(clear_color) = self.render_target_mode.color()
-        {
-            load = wgpu::LoadOp::Clear(clear_color);
-        }
+        self.resolve_state.mark_resolved();
+        let load = if self.color_needs_clear.set(false).is_ok() {
+            self.render_target_mode
+                .color()
+                .map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear)
+        } else {
+            wgpu::LoadOp::Load
+        };
         Some(wgpu::RenderPassColorAttachment {
             view: self.frame_buffer.view(),
             resolve_target: self.resolve_buffer.as_ref().map(|b| b.view()),
@@ -531,6 +555,86 @@ impl CommandTarget {
             .as_ref()
             .map(|b| b.texture())
             .unwrap_or_else(|| self.frame_buffer.texture())
+    }
+}
+
+fn dirty_tile_color_attachment<'a>(
+    view: &'a wgpu::TextureView,
+) -> wgpu::RenderPassColorAttachment<'a> {
+    wgpu::RenderPassColorAttachment {
+        view,
+        resolve_target: None,
+        ops: wgpu::Operations {
+            load: wgpu::LoadOp::Load,
+            store: wgpu::StoreOp::Store,
+        },
+        depth_slice: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ResolveState, dirty_tile_color_attachment};
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn dirty_tile_attachment_does_not_resolve() {
+        let instance = crate::backend::create_wgpu_instance(
+            wgpu::Backends::all(),
+            wgpu::BackendOptions::default(),
+        );
+        let Ok((_adapter, device, _queue)) =
+            futures::executor::block_on(crate::backend::request_adapter_and_device(
+                wgpu::Backends::all(),
+                &instance,
+                None,
+                wgpu::PowerPreference::LowPower,
+            ))
+        else {
+            return;
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let attachment = dirty_tile_color_attachment(&view);
+
+        assert!(attachment.resolve_target.is_none());
+        assert!(matches!(attachment.ops.load, wgpu::LoadOp::Load));
+        assert!(matches!(attachment.ops.store, wgpu::StoreOp::Store));
+    }
+
+    #[test]
+    fn deferred_resolve_is_consumed_by_the_first_following_pass() {
+        let state = ResolveState::default();
+        assert!(!state.is_pending());
+
+        state.defer();
+        assert!(state.is_pending());
+
+        state.mark_resolved();
+        assert!(!state.is_pending());
+    }
+
+    #[test]
+    fn a_new_dirty_pass_defers_the_next_resolve() {
+        let state = ResolveState::default();
+        state.defer();
+        state.mark_resolved();
+        state.defer();
+
+        assert!(state.is_pending());
     }
 }
 
