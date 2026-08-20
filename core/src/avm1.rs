@@ -9,6 +9,7 @@ mod function;
 #[macro_use]
 mod property_decl;
 
+mod action_cache;
 mod activation;
 mod amf;
 mod callable_value;

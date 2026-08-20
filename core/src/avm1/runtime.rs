@@ -1,3 +1,4 @@
+use crate::avm1::action_cache::ActionCache;
 use crate::avm1::function::ExecutionReason;
 use crate::avm1::globals::as_broadcaster::BroadcasterFunctions;
 use crate::avm1::globals::{as_broadcaster, create_globals};
@@ -72,6 +73,9 @@ pub struct Avm1<'gc> {
     /// The operand stack (shared across functions).
     stack: Vec<Value<'gc>>,
 
+    #[collect(require_static)]
+    pub(crate) action_cache: ActionCache,
+
     /// The register slots (also shared across functions).
     /// `ActionDefineFunction2` defined functions do not use these slots.
     registers: [Value<'gc>; 4],
@@ -123,6 +127,7 @@ impl<'gc> Avm1<'gc> {
             env_case_sensitive: GlobalEnv::create(context),
             display_properties: stage_object::DisplayPropertyMap::new(context),
             stack: vec![],
+            action_cache: ActionCache::new(),
             registers: [Value::Undefined; 4],
             halted: false,
             max_recursion_depth: 255,
